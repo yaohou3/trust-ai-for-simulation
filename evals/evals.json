@@ -1,0 +1,26 @@
+{
+  "skill_name": "trust-framework-vvuq",
+  "evals": [
+    {
+      "id": 1,
+      "name": "stage-a-dsl-from-description",
+      "prompt": "I've got this ER description doc my colleague sent me — it walks through the patient flow (arrivals, triage, treatment by acuity, departure). I want you to turn it into a typed simulation specification so I can later generate code from it. It's an ER simulation, so things like Poisson arrivals, four acuity classes with different service times, single doctor I think. The description is at examples/simple_er/description.docx. Make sure the spec captures what's actually in the description and flags anything you had to assume.",
+      "expected_output": "A draft my_dsl.json conforming to the typed schema, with declared values from the description and any LLM-assumed values flagged as assumed_default: true with a written rationale. The DSL should include arrivals, service_rates per acuity, the treatment resource, and any declared mechanisms. Ideally the description→DSL coverage gate (A4) is run and reported.",
+      "files": ["examples/simple_er/description.docx"]
+    },
+    {
+      "id": 2,
+      "name": "stage-c-credibility-check",
+      "prompt": "We have a SimPy simulation of an ICU staffing model that an LLM produced from our spec. Before I use it to decide whether to add a third consultant on day shift, I need to know whether the model is actually credible — does it implement what we declared, and does it pass mathematical and structural V&V checks? The DSL is my_dsl.json, the sim is my_sim.py. Run the full verification pipeline and tell me if I should trust it.",
+      "expected_output": "Invocation of verify_and_run.py through the full Stage C pipeline (preflights → integrity guards → Phase 0 → Phase 1 → Phase 2 → Phase 3 → Phase 4). Per-phase verdicts reported. If any failures, classification as SIM_CODE / DSL_SPEC / VALIDATOR_FIX with appropriate routing. Final state should be either the green VERIFIED banner or an honest UNVERIFIED result with the specific blocker named.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "name": "stage-d-decision-validity",
+      "prompt": "I have a verified manufacturing line simulation (passes Phase 0–4 cleanly). The decision I'm trying to support is whether adding a second polishing station would reduce average system time below the 90-minute SLA. I want what-if scenario evidence specifically targeting that decision claim. Can you run the Phase 4.5 harness and tell me whether the model gives me decision-grade evidence for or against the second polisher? I care about the three-dimension verdict — Credibility, Causal Validity, Decision Validity — not a single pass/fail.",
+      "expected_output": "Phase 4.5 invocation with declared scenarios + canonical scenarios. Per-scenario verdicts (PASS / FAIL / INCONCLUSIVE / BLOCK / NOT_A_CLAIM) and provenance-weighted aggregate. Then a Stage E three-dimension verdict reporting Credibility / Causal Validity / Decision Validity on separate lines. If Decision Validity is below PASS, the 'what would move Decision Validity to PASS' recommendation should be given (e.g., declare an authoritative scenario for the polisher question).",
+      "files": []
+    }
+  ]
+}

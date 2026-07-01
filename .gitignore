@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.pytest_cache/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# Framework outputs (regenerated per run; not part of the skill itself)
+vvuq_out/
+*.log
+*_workspace/
+
+# Build artefacts
+*.skill
+build/
+dist/
+
+# Local config
+.env
+.env.local
