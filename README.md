@@ -1,8 +1,7 @@
 # Trust Framework for LLM-Generated Simulations
 
-A verification, validation, and uncertainty quantification (V&V/UQ) framework
-for discrete-event simulation models whose construction is mediated by large
-language models, packaged as a Claude Code / Claude Agent SDK **skill**.
+A credibility framework for discrete-event simulation models whose construction 
+is mediated by large language models, packaged as a Claude Code / Claude Agent SDK **skill**.
 
 This skill produces a non-collapsing three-dimension credibility verdict —
 **Credibility, Causal Validity, Decision Validity** — and refuses to credential
