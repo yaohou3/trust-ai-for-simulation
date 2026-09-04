@@ -87,16 +87,26 @@ STALE_NOTICE_NAME = "UNVERIFIED_RESULT.txt"
 # auditable, and we REFUSE TO RUN if a required grader is missing (the failure
 # mode where a missing harness tempts the LLM to write — and grade itself with
 # — a weaker substitute).
+# AUDIT FIX (C3): modules that Phase 0 hard-imports were previously listed
+# "optional" — their absence crashed Phase 0 with a generic error instead of
+# the intended "restore the graders" banner. Every module the phase pipeline
+# imports (directly or transitively) is REQUIRED: phase0_vvuq imports
+# vvuq_utils, process_contracts, semantic_checks; the Phase 0 path runs
+# through run_vvuq.py. Genuinely optional modules are only those whose
+# absence degrades a feature without crashing a phase.
 _REQUIRED_CHECKERS = [
     "validation.py",
     "phase0_vvuq.py",
     "semantic_scenarios.py",
     "run_validators.py",
     "self_heal_orchestrator.py",
+    "vvuq_utils.py",
+    "process_contracts.py",
+    "semantic_checks.py",
+    "run_vvuq.py",
 ]
 _OPTIONAL_CHECKERS = [
-    "compliance_mapper.py", "process_contracts.py", "semantic_checks.py",
-    "coverage_validator.py", "vvuq_utils.py", "dsl_schema.py",
+    "compliance_mapper.py", "coverage_validator.py", "dsl_schema.py",
     "scenario_ingest.py", "decision_validity.py",
 ]
 
@@ -180,6 +190,7 @@ def _stop_banner(rc: int, out_dir: str, sim_path: str) -> None:
         3: "STOP — the verifier could not run. Do not use this result.",
         4: "STOP — the code changed numbers from the approved model. Do not use this result.",
         5: "STOP — the code may have changed how the model behaves. Do not use this result.",
+        6: "STOP — the model identity changed since the baselines were set. Do not use this result.",
     }
     actions = {
         1: ("A repair instruction was written. Ask Claude Code to apply the fix\n"
@@ -203,6 +214,12 @@ def _stop_banner(rc: int, out_dir: str, sim_path: str) -> None:
             "  rather than fixing it. Tell Claude Code to REVERT it; the failing\n"
             "  check is most likely a framework issue, not a model bug.\n"
             f"  Details: {os.path.join(out_dir, 'suspicious_patch.md')}"),
+        6: ("The specification (DSL) or model identity changed since the integrity\n"
+            "  baselines were established. If YOU revised the specification (after\n"
+            "  Stage A review), re-run this command with --reset to start a new\n"
+            "  credibility chain for the revised model. If you did NOT change the\n"
+            "  specification, something else edited it — investigate before\n"
+            "  trusting any result."),
     }
     print(f"  {headers.get(rc, 'STOP — verification did not pass. Do not use this result.')}")
     print()
@@ -214,6 +231,53 @@ def _stop_banner(rc: int, out_dir: str, sim_path: str) -> None:
 
 
 # ── manifest lifecycle ────────────────────────────────────────────────────
+def _ledger_report_mismatches(out_dir: str, state: dict,
+                              phases: list[str]) -> list[str]:
+    """AUDIT FIX (C2, partial): cross-check the ledger's claimed per-phase
+    verdicts against the per-phase report files on disk before stamping.
+
+    The self-heal ledger is plain JSON; a forged ledger (every phase PASS
+    at the current sim hash) previously skipped all validators AND fed the
+    stamped manifest directly. Cryptographic signing does not help under
+    this framework's adversary model (a filesystem-capable LLM can read
+    any key), so the proportionate defence is consistency: a ledger claim
+    with no corresponding phase report, or one contradicting the report's
+    own status, refuses the stamp. (A forger must now also forge every
+    report file — moving this attack fully into the declared out-of-scope
+    hand-forgery class documented in the module header.)
+    Returns a list of human-readable mismatch descriptions (empty = OK)."""
+    mismatches: list[str] = []
+    ledger = state.get("phase_ledger", {})
+    for ph in phases:
+        rec = ledger.get(ph)
+        if not rec or rec.get("status") not in ("PASS", "WARN"):
+            continue    # non-passing ledger entries never stamp VERIFIED anyway
+        rpt_path = os.path.join(out_dir, f"phase{ph}_report.json")
+        if not os.path.isfile(rpt_path):
+            mismatches.append(
+                f"Phase {ph}: ledger claims {rec.get('status')} but no "
+                f"phase{ph}_report.json exists in {out_dir}")
+            continue
+        try:
+            with open(rpt_path) as f:
+                data = json.load(f)
+        except Exception as exc:
+            mismatches.append(
+                f"Phase {ph}: ledger claims {rec.get('status')} but "
+                f"phase{ph}_report.json is unreadable ({exc})")
+            continue
+        rpt_status = (data.get("status") or "").upper()
+        if not rpt_status:
+            gate = (data.get("gate") or "").upper()
+            if gate:
+                rpt_status = "PASS" if gate == "OPEN" else "BLOCK"
+        if rpt_status in ("FAIL", "BLOCK"):
+            mismatches.append(
+                f"Phase {ph}: ledger claims {rec.get('status')} but the "
+                f"report file records {rpt_status}")
+    return mismatches
+
+
 def _write_manifest(out_dir: str, sim_path: str, dsl_path: str | None,
                     config_path: str | None, state: dict,
                     phases: list[str], step4_current: bool) -> str:
@@ -393,9 +457,31 @@ def main(argv: list[str] | None = None) -> int:
                 print(_rule())
                 return 3
         except Exception as _exc:
-            print(f"[verify] DSL→code coverage preflight skipped ({_exc}); "
-                  "proceeding to Stage C. Provide a readable --dsl and a sim "
-                  "with a manifest() / MANIFEST attribute to enable it.")
+            # AUDIT FIX (H10): this preflight previously failed OPEN — any
+            # exception (malformed DSL JSON, a sim whose import crashes, a
+            # manifest() that raises, a checker bug) skipped the gate and
+            # proceeded to Stage C. That inverted the gate's purpose: this
+            # is the deterministic counterpart to the Code Alignment Review
+            # precisely because it "cannot be persuaded" — but a shape that
+            # crashes the checker was a persuasion-free bypass. The only
+            # legitimate skip is the absence of --dsl (handled by the outer
+            # `if`); an exception here is now a STOP.
+            import traceback as _tb
+            print()
+            print(_rule())
+            print("  STOP — DSL→code coverage preflight could not run.")
+            print()
+            print(f"  The coverage check raised: {_exc!r}")
+            print()
+            print("  A crashed gate is absence of verification, not a pass.")
+            print("  Common causes: malformed --dsl JSON, a sim file that")
+            print("  raises on import, or a MANIFEST/manifest() with an")
+            print("  unexpected shape. Diagnose and fix the artefact (or")
+            print("  escalate as VALIDATOR_FIX if the checker itself is at")
+            print("  fault), then re-run.")
+            print(_rule())
+            print(_tb.format_exc(limit=5), file=sys.stderr)
+            return 3
 
     # Determine the phase list the same way the orchestrator does, so the
     # manifest reports verdicts for exactly the phases that ran.
@@ -425,6 +511,29 @@ def main(argv: list[str] | None = None) -> int:
 
     if rc == 0:
         state = orch._load_state(args.out)
+        # AUDIT FIX (C2, partial): before stamping, cross-check the ledger's
+        # claimed verdicts against the per-phase report files. A forged
+        # ledger (which skips all validators) no longer stamps unless every
+        # report file has also been forged consistently.
+        mismatches = _ledger_report_mismatches(args.out, state, phases)
+        if mismatches:
+            print()
+            print(_rule())
+            print("  STOP — ledger/report inconsistency. Do not use this result.")
+            print()
+            print("  The self-heal ledger claims phases passed, but the phase")
+            print("  report files on disk do not corroborate:")
+            for m in mismatches:
+                print(f"    - {m}")
+            print()
+            print("  This indicates either state corruption or ledger tampering.")
+            print("  Re-run with --reset to rebuild the credibility chain from")
+            print("  scratch (all phases will be re-verified).")
+            print(_rule())
+            _invalidate_manifest(args.out,
+                                 "Ledger/report inconsistency at stamp time: "
+                                 + "; ".join(mismatches))
+            return 3
         sim_hash = orch._sim_sha256(args.sim)
         step4_hash = state.get("step4_approved_sim_hash")
         step4_current = step4_hash is not None and step4_hash == sim_hash

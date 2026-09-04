@@ -54,6 +54,7 @@ import argparse
 import json
 import re
 import sys
+from collections import defaultdict
 
 
 # Regex that pulls a leading numeric value (with optional sign and decimal),

@@ -495,8 +495,20 @@ def _evaluation(spec: dict) -> dict:
 
 def _per_metric_expectation(spec: dict, metric_name: str, default_exp: dict) -> dict:
     """Allow `metrics: [{"name": ..., "direction": ..., "min_effect_size": ...}]`
-    entries to override the claim-level expectation."""
-    direction = (default_exp.get("direction") or "unchanged").lower()
+    entries to override the claim-level expectation.
+
+    AUDIT FIX (C7): an ABSENT direction must not default to "unchanged".
+    Under paired seeds with empty overrides, control and treatment cells are
+    bit-identical, so an "unchanged" claim passes trivially — meaning a bare
+    scenario like ``{"name": "x"}`` with no expectation at all would earn an
+    authoritative PASS. A scenario that asserts nothing is not evidence.
+    Absent direction now resolves to the sentinel "undeclared", which
+    _evaluate_claim's existing NOT_A_CLAIM branch rejects (same treatment as
+    the explicit direction-relaxation guard for "any"). A scenario that
+    EXPLICITLY declares direction "unchanged" is still a real, falsifiable
+    equivalence claim and is evaluated as before.
+    """
+    direction = (default_exp.get("direction") or "undeclared").lower()
     min_effect = default_exp.get("min_effect_size")
     for m in spec.get("metrics", []) or []:
         if isinstance(m, dict) and m.get("name") == metric_name:
@@ -692,14 +704,22 @@ def canonical_scenarios(compliance_spec: dict) -> list[dict]:
     preempt_section = cs.get("preemption_rules") or []
     preempt_procs = [p for p in procs if p.get("preempts")]
 
-    # Soft pools: try coordination_patterns (mapper-emitted) with
-    # `pool_type: soft`, then fall back to resources with
-    # `capacity_mode: soft` (legacy).
+    # Soft pools: coordination_patterns entries emitted by compliance_mapper.py
+    # carry the coordination kind under the `type` field (values include
+    # `soft_pool`, `hard_pool`, `role_anchored`). Earlier drafts of this
+    # generator looked only for `pool_type` / `pattern_type`, neither of which
+    # the mapper ever emits — so canonical_soft_pool_scaling silently never
+    # synthesized for any DSL processed through the framework's own mapper.
+    # We now check `type` first (mapper-emitted), then the legacy variants,
+    # then fall back to resources with `capacity_mode: soft` for older DSLs.
     coord_patterns = cs.get("coordination_patterns") or []
-    soft_pools_coord = [c for c in coord_patterns
-                        if (c.get("pool_type") or
-                            c.get("pattern_type") or "").lower() == "soft_pool"
-                        or (c.get("capacity_mode") or "").lower() == "soft"]
+    def _is_soft_pool(c: dict) -> bool:
+        for key in ("type", "pool_type", "pattern_type", "coordination_type"):
+            v = (c.get(key) or "").lower()
+            if v in ("soft_pool", "soft"):
+                return True
+        return (c.get("capacity_mode") or "").lower() == "soft"
+    soft_pools_coord = [c for c in coord_patterns if _is_soft_pool(c)]
     soft_pools_res = [r for r in resources
                       if (r.get("capacity_mode") or "").lower() == "soft"]
     soft_pools = soft_pools_coord or soft_pools_res
@@ -740,17 +760,18 @@ def canonical_scenarios(compliance_spec: dict) -> list[dict]:
             "name":               "canonical_workload_response",
             "scenario_category":  "workload_response",
             "scale_factor":       1.3,
-            # Multiple candidate metric names. The harness runs each as a
-            # separate ScenarioResult; metrics absent from the sim's report
-            # produce per-metric INCONCLUSIVE (which is documented behaviour)
-            # while present metrics produce PASS/FAIL. At least one of these
-            # is typically reported by any congestion-aware DES.
-            "metrics": [
-                {"name": "mean_sojourn",     "direction": "up"},
-                {"name": "avg_system_time",  "direction": "up"},
-                {"name": "total_time_in_system", "direction": "up"},
-                {"name": "mean_wait",        "direction": "up"},
-                {"name": "queue_length_mean","direction": "up"},
+            # AUDIT FIX (H8): SYNONYM SET, not a metrics list. The previous
+            # shape listed 5 candidate metrics, each evaluated as a separate
+            # ScenarioResult — but the codegen brief only requires ONE
+            # sojourn-class metric, so ≥3 were absent by contract, producing
+            # ≥3 authoritative INCONCLUSIVEs that capped the aggregate at
+            # WARN on every brief-compliant sim. With metric_synonyms the
+            # harness resolves the FIRST name present in the sim's report
+            # and emits ONE result; only if none is present does it emit a
+            # single INCONCLUSIVE.
+            "metric_synonyms": [
+                "mean_sojourn", "avg_system_time", "total_time_in_system",
+                "mean_wait", "queue_length_mean",
             ],
             "expectation":        {"direction": "up", "min_effect_size": 0.05},
             "evaluation":         {"method": "bootstrap_mean_diff",
@@ -775,19 +796,36 @@ def canonical_scenarios(compliance_spec: dict) -> list[dict]:
                                    "confidence": 0.95, "replications": 2000},
         })
     elif preempt_section:
-        # Derived from preemption_rules — same shape via higher/lower priority
-        # pair, expressed as source/victim processes.
+        # Derived from preemption_rules. Different DSL versions and
+        # different mapper implementations emit the source/victim pair
+        # under different field names. Try in order:
+        #   higher_priority/lower_priority (v5.3 explicit pair)
+        #   applies_to_processes[0] / preemptible_by[0] (v5.2 default)
+        #   name / (first item in competing_risks) (legacy)
         rule = preempt_section[0]
-        out.append({
-            "name":               "canonical_preemption_causality",
-            "scenario_category":  "coupling",
-            "source_process":     rule.get("higher_priority"),
-            "target_process":     rule.get("lower_priority"),
-            "metrics":            [{"name": "preemption_count", "direction": "up"}],
-            "expectation":        {"direction": "up", "min_effect_size": 0.10},
-            "evaluation":         {"method": "bootstrap_mean_diff",
-                                   "confidence": 0.95, "replications": 2000},
-        })
+        source_process = (
+            rule.get("higher_priority")
+            or (rule.get("applies_to_processes") or [None])[0]
+            or rule.get("source_process")
+            or rule.get("name")
+        )
+        target_process = (
+            rule.get("lower_priority")
+            or (rule.get("preemptible_by") or [None])[0]
+            or rule.get("target_process")
+            or rule.get("victim_process")
+        )
+        if source_process:
+            out.append({
+                "name":               "canonical_preemption_causality",
+                "scenario_category":  "coupling",
+                "source_process":     source_process,
+                "target_process":     target_process,
+                "metrics":            [{"name": "preemption_count", "direction": "up"}],
+                "expectation":        {"direction": "up", "min_effect_size": 0.10},
+                "evaluation":         {"method": "bootstrap_mean_diff",
+                                       "confidence": 0.95, "replications": 2000},
+            })
 
     # ── Claim 2: soft_pool_scaling ──────────────────────────────────────────
     if soft_pools:
@@ -848,9 +886,19 @@ def canonical_scenarios(compliance_spec: dict) -> list[dict]:
         })
 
     # ── Claim 5: state_transition_sensitivity ───────────────────────────────
+    # The mapper's `state_transition_rules` entries carry the state under
+    # `state` (v5.3) with source_ids for provenance. Older schemas used
+    # `name` or `from_state`. Try all in order so the claim can synthesize
+    # a meaningful label regardless of mapper version.
     if transitions:
         t = transitions[0]
-        tname = t.get("name") or t.get("from_state") or "transition"
+        tname = (
+            t.get("name")
+            or t.get("from_state")
+            or t.get("state")
+            or (t.get("source_ids") or [None])[0]
+            or "transition"
+        )
         out.append({
             "name":               f"canonical_transition_{tname}",
             "scenario_category":  "emergent_pattern",
@@ -863,6 +911,18 @@ def canonical_scenarios(compliance_spec: dict) -> list[dict]:
         })
 
     # ── Claim 6: queue_discipline ───────────────────────────────────────────
+    # AUDIT FIX (H9): the previous claim expected the queue's OVERALL p95
+    # wait to DROP under priority discipline vs FIFO. Queueing theory says
+    # otherwise: for a work-conserving non-preemptive discipline switch with
+    # service-time-independent priorities, the conservation law fixes the
+    # mean wait, priority redistributes wait from high- to low-priority
+    # customers, and FIFO minimizes waiting-time variance in this class — so
+    # the overall p95 under priority is typically ≥ FIFO's. The old claim
+    # could FAIL a CORRECT sim on a wrong-theory expectation. The
+    # theoretically defensible claim targets the HIGH-PRIORITY CLASS's p95,
+    # which priority scheduling does reduce. Requires the per-class metric
+    # `wait_time_p95.<queue>.high_priority` (documented in CODEGEN_BRIEF);
+    # sims not exposing it produce a single INCONCLUSIVE, not a FAIL.
     if queues:
         q = queues[0]
         qname = q.get("name") or "queue"
@@ -871,7 +931,8 @@ def canonical_scenarios(compliance_spec: dict) -> list[dict]:
             "scenario_category":  "emergent_pattern",
             "control":    {"parameters": {"queue_discipline": {qname: "FIFO"}}},
             "treatment":  {"parameters": {"queue_discipline": {qname: "priority"}}},
-            "metrics": [{"name": f"wait_time_p95.{qname}", "direction": "down"}],
+            "metrics": [{"name": f"wait_time_p95.{qname}.high_priority",
+                         "direction": "down"}],
             "expectation":        {"direction": "down", "min_effect_size": 0.05},
             "evaluation":         {"method": "paired_crn_median_diff",
                                    "confidence": 0.95, "replications": 2000},
@@ -942,6 +1003,36 @@ def _eval_one(
         treat_samples = _run_cell(run_simulation, treat_cfg, seeds, metric_extractor)
     except Exception as exc:
         return [_block(metric_names[0], f"Simulation raised {type(exc).__name__}: {exc}")]
+
+    # Synonym-set resolution (audit H8): a claim may declare
+    # `metric_synonyms: [...]` instead of `metrics: [...]`. The names are
+    # SYNONYMS for one underlying quantity under different sim naming
+    # conventions — evaluate exactly ONE result: the first name present in
+    # BOTH cells' samples. Only when none is present does the claim emit a
+    # single INCONCLUSIVE (rather than one per absent name, which
+    # previously guaranteed authoritative INCONCLUSIVEs that capped the
+    # aggregate at WARN for every brief-compliant sim).
+    synonyms = spec.get("metric_synonyms")
+    if isinstance(synonyms, list) and synonyms:
+        resolved = next(
+            (m for m in synonyms
+             if ctrl_samples.get(m) and treat_samples.get(m)), None)
+        if resolved is None:
+            return [ScenarioResult(
+                name=name, category=category,
+                metric=f"(none of {len(synonyms)} synonyms present)",
+                method=ev["method"],
+                expected_direction=(claim_exp.get("direction") or "?"),
+                expected_magnitude=claim_exp.get("min_effect_size"),
+                delta_mean=0.0, relative_change=0.0, ci_95=(0.0, 0.0),
+                confidence=ev["confidence"], direction_pass=False,
+                magnitude_pass=False, verdict="INCONCLUSIVE",
+                message=(f"None of the synonym metrics {synonyms} present in "
+                         f"the sim's report — expose one of them to enable "
+                         f"this claim."),
+                n_seeds=len(seeds), provenance=provenance, advisory=advisory,
+            )]
+        metric_names = [resolved]
 
     out: list[ScenarioResult] = []
     for metric in metric_names:

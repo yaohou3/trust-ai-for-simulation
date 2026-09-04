@@ -687,27 +687,52 @@ def check_rooted_flow_conservation(ctx: Phase0Context) -> list[CheckResult]:
             elif e["event"] == "loss":
                 entity_losses.add(ent_id)
 
+        # AUDIT FIX (C6): the previous gate derived s_rooted as
+        # a - d - l and then tested d + l + s == a, which substitutes to
+        # a == a — an identity that can never fail, making the advertised
+        # BLOCK branch unreachable. The real structural constraints are:
+        #   (1) no entity is BOTH departed and lost (double-termination);
+        #   (2) with exclusive terminals, in-system count is non-negative
+        #       (a negative residual means orphan terminals or double
+        #       counting somewhere).
         rooted_entities = {eid for eid, atime in entity_arrivals.items() if atime >= warmup}
         a_rooted = len(rooted_entities)
         d_rooted = len(rooted_entities & entity_departures)
         l_rooted = len(rooted_entities & entity_losses)
-        s_rooted = a_rooted - d_rooted - l_rooted
+        dbl_rooted = rooted_entities & entity_departures & entity_losses
+        s_rooted = a_rooted - d_rooted - l_rooted + len(dbl_rooted)
 
-        if d_rooted + l_rooted + s_rooted == a_rooted:
+        if dbl_rooted:
+            sample = sorted(str(x) for x in dbl_rooted)[:5]
             results.append(CheckResult(
-                "PASS", "B21_rooted_balance",
-                f"Rooted accounting OK: {a_rooted} arrivals = {d_rooted} dep + {l_rooted} loss + {s_rooted} in-system. "
-                f"(basis={accounting_basis})",
-                {"arrivals": a_rooted, "departures": d_rooted, "losses": l_rooted, "in_system": s_rooted,
+                "BLOCK", "B21_rooted_balance",
+                f"Rooted accounting FAILURE: {len(dbl_rooted)} entit"
+                f"{'y' if len(dbl_rooted)==1 else 'ies'} terminated BOTH by "
+                f"departure and by loss (e.g. {sample}). Each entity must end "
+                f"in exactly one terminal outcome. (basis={accounting_basis})",
+                {"arrivals": a_rooted, "departures": d_rooted,
+                 "losses": l_rooted, "double_terminated": len(dbl_rooted),
+                 "double_terminated_sample": sample,
                  "accounting_basis": accounting_basis},
+            ))
+        elif s_rooted < 0:
+            results.append(CheckResult(
+                "BLOCK", "B21_rooted_balance",
+                f"Rooted accounting FAILURE: negative in-system residual "
+                f"({a_rooted} arrivals − {d_rooted} dep − {l_rooted} loss = "
+                f"{s_rooted}) — more terminal events than rooted arrivals "
+                f"(orphan terminals or double counting). "
+                f"(basis={accounting_basis})",
+                {"arrivals": a_rooted, "departures": d_rooted, "losses": l_rooted,
+                 "in_system": s_rooted, "accounting_basis": accounting_basis},
             ))
         else:
             results.append(CheckResult(
-                "BLOCK", "B21_rooted_balance",
-                f"Rooted accounting FAILURE: {a_rooted} arrivals ≠ {d_rooted}+{l_rooted}+{s_rooted} (structural bug). "
-                f"(basis={accounting_basis})",
+                "PASS", "B21_rooted_balance",
+                f"Rooted accounting OK: {a_rooted} arrivals = {d_rooted} dep + {l_rooted} loss + {s_rooted} in-system; "
+                f"no double-terminated entities. (basis={accounting_basis})",
                 {"arrivals": a_rooted, "departures": d_rooted, "losses": l_rooted, "in_system": s_rooted,
-                 "accounting_basis": accounting_basis},
+                 "double_terminated": 0, "accounting_basis": accounting_basis},
             ))
 
     # ── Windowed accounting (run unless basis is explicitly "rooted") ─────────
@@ -1152,11 +1177,22 @@ def validate_process_contracts(ctx: Phase0Context) -> list[CheckResult]:
             results.extend(check_workload_realism(ctx, process_name, contract, episodes))
 
         except Exception as e:
-            # Catch any per-process errors and report as WARN (never silently suppress)
+            # AUDIT FIX (N1): a crashing process-contract validator must emit
+            # BLOCK, not WARN. The orchestrator treats WARN as validated, so
+            # the previous WARN downgrade meant a validator crash SILENTLY
+            # VALIDATED its phase — a fail-open path. BLOCK matches the
+            # B24–B41 semantic-contract wrapper and correctly halts the
+            # pipeline until the crash is diagnosed (usually a VALIDATOR_FIX
+            # or a malformed contract entry, i.e. DSL_SPEC).
+            import traceback as _tb
             results.append(CheckResult(
-                "WARN", f"B18_B24[{process_name}]",
-                f"Exception during process validation: {e}",
-                {"error": str(e)},
+                "BLOCK", f"B18_B24[{process_name}]",
+                f"Exception during process validation: {e!r} — a crashed "
+                f"validator is absence of verification, not a pass. Classify "
+                f"as VALIDATOR_FIX (checker bug) or DSL_SPEC (malformed "
+                f"contract entry) and resolve before trusting this phase.",
+                {"error": str(e),
+                 "traceback": _tb.format_exc(limit=5)},
             ))
 
     return results

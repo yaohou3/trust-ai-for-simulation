@@ -173,13 +173,25 @@ def _trace_identity(sim_path: str) -> str | None:
     return hashlib.sha256(classes.encode()).hexdigest()
 
 
+# Fractional-suppression threshold (audit M1): a class whose count drops
+# below this fraction of a substantial baseline is flagged even though the
+# class still exists. Whole-class checks alone let a patch suppress 90%+ of
+# a real event class (keeping a token few) — exactly how count-based checks
+# get gamed. Legitimate fixes that genuinely shift counts this far route
+# through the existing --accept-trace-change rebaseline, same as whole-class
+# changes, so the repair loop cannot deadlock.
+_FIDELITY_SUPPRESSION_RATIO = 0.5
+_FIDELITY_SUPPRESSION_MIN_BASE = 20
+
+
 def _fidelity_deltas(baseline: dict, current: dict) -> list[str]:
-    """Return human-readable descriptions of whole-event-class appearances or
-    disappearances between two trace profiles. Whole-class changes are the
-    low-false-positive signal: a legitimate fix rarely makes an entire event
-    type vanish or a brand-new one appear; suppression/synthesis does exactly
-    that. (Magnitude shifts within an existing class are reported as context
-    only, not flagged, since legitimate fixes can shift counts.)"""
+    """Return human-readable descriptions of suspicious trace-profile changes
+    between runs: whole-event-class appearances/disappearances (the
+    low-false-positive signal — suppression/synthesis does exactly that),
+    plus large fractional suppressions within a surviving class (audit M1:
+    dropping a class from 1000 events to a token 4 previously passed because
+    the class still 'existed'). Moderate count shifts remain unflagged since
+    legitimate fixes can shift counts."""
     deltas: list[str] = []
     keys = set(baseline) | set(current)
     for k in sorted(keys):
@@ -191,6 +203,14 @@ def _fidelity_deltas(baseline: dict, current: dict) -> list[str]:
         elif c >= _FIDELITY_MIN_COUNT and b == 0:
             deltas.append(f"event class '{k}' APPEARED (0 → {c}) — patch may have "
                           "synthesized events")
+        elif (b >= _FIDELITY_SUPPRESSION_MIN_BASE and c > 0
+              and c < b * _FIDELITY_SUPPRESSION_RATIO):
+            deltas.append(
+                f"event class '{k}' SUPPRESSED ({b} → {c}, "
+                f"-{(1 - c / b):.0%}) — a drop this large in a surviving "
+                f"class is the signature of partial event suppression; if "
+                f"the change is a genuine consequence of a correct fix, "
+                f"re-run with --accept-trace-change")
     return deltas
 
 
@@ -755,27 +775,45 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[self_heal] could not hash sim file: {args.sim}", file=sys.stderr)
         return 3
 
-    # ── Model-identity guard (prevents stale-state false positives) ────────
-    # The baselines (param fingerprint, trace profile, phase ledger) are keyed to
-    # the output dir. If a DIFFERENT model is run into a reused out dir, those
-    # baselines belong to the old model, so the parameter/fidelity guards would
-    # fire a spurious ILLEGAL_PATCH / SUSPICIOUS_PATCH — which reads like a gaming
-    # accusation but is really just stale state. We give the model an identity and
-    # auto-rebaseline (NOT a violation) when it changes. A genuine DSL revision of
-    # the SAME model also changes the identity, which correctly rebaselines too —
-    # matching the documented "revise DSL → re-run with --reset" flow.
+    # ── Model-identity guard ───────────────────────────────────────────────
+    # The baselines (param fingerprint, trace profile, phase ledger) are keyed
+    # to the output dir. If the model identity (DSL hash, or trace-identity
+    # when no DSL is given) changes between runs, those baselines belong to a
+    # different model.
+    #
+    # SECURITY NOTE (audit C1): this guard must NOT auto-rebaseline. The
+    # param-fingerprint and trace-fidelity guards below run against the stored
+    # baselines; wiping state here would let them silently adopt fresh
+    # baselines, so an edit to my_dsl.json (changing its hash) would disarm
+    # all three guards at once — a change to declared parameters plus a DSL
+    # bump would pass clean and still print the VERIFIED banner. Instead we
+    # STOP with a distinct exit code and require the user to decide:
+    #   - stale state from a genuinely different model → re-run with --reset
+    #     (or use a fresh --out dir per model);
+    #   - a DSL revision of the same model → this is the documented
+    #     DEFER_TO_DSL flow, which already prescribes re-running with --reset
+    #     after the revision is reviewed at Stage A.
+    # Either way, the decision to discard baselines is the USER's, made
+    # explicitly — never an automatic side effect of an artefact edit.
     model_id = _sim_sha256(args.dsl) if args.dsl else _trace_identity(args.sim)
     stored_model_id = state.get("model_id")
     if (not args.reset and stored_model_id and model_id
             and stored_model_id != model_id):
-        print("[self_heal] MODEL CHANGED — the saved baselines in this output dir "
-              "belong to a different model")
-        print(f"[self_heal]   (stored model_id {str(stored_model_id)[:12]} ≠ current "
-              f"{str(model_id)[:12]}). This is NOT a parameter violation.")
-        print("[self_heal]   Auto-rebaselining for the new model. (Use a fresh --out "
-              "dir per model to avoid this notice.)")
-        state = {"attempts_by_phase": {}, "model_id": model_id}
-        _save_state(args.out, state)
+        print("[self_heal] MODEL_CHANGED: the model identity differs from the one "
+              "these baselines belong to.")
+        print(f"[self_heal]   stored model_id {str(stored_model_id)[:12]} ≠ current "
+              f"{str(model_id)[:12]}")
+        print("[self_heal] Refusing to proceed: continuing would silently discard "
+              "the parameter-fingerprint")
+        print("[self_heal] and trace-fidelity baselines, disarming the integrity "
+              "guards.")
+        print("[self_heal] If this is a REVIEWED model/DSL revision (or a different "
+              "model in a reused out dir),")
+        print("[self_heal] re-run with --reset to explicitly start a new credibility "
+              "chain. If you did NOT")
+        print("[self_heal] intend the model to change, inspect what edited the DSL "
+              "before trusting anything.")
+        return 6
     elif model_id and not stored_model_id:
         state["model_id"] = model_id
         _save_state(args.out, state)

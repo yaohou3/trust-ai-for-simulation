@@ -457,16 +457,66 @@ def _check_a8_clean_shutdown(ctx: Phase0Context) -> list[CheckResult]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def verify_arrivals(ctx: Phase0Context) -> list[CheckResult]:
-    """B01: Arrival rate per day vs declared expected_rate_per_day."""
+    """B01: Arrival rate per day vs declared expected_rate_per_day.
+
+    Regime-aware windowing: for terminating/burst simulations, arrivals
+    occur only over a declared window that is typically much shorter
+    than the run_length (which must extend past the arrival window so
+    the system can drain). Measuring rate as arrivals ÷ full_run_length
+    produces an artifactually low observed rate that depends on the
+    arbitrary drain-buffer choice rather than on the modelled arrival
+    process. When ``simulation_regime.type ∈ {terminating, burst}`` and
+    ``arrival_window_seconds`` is declared, this check counts only
+    arrivals that fell inside the declared window and divides by the
+    window length (in days) rather than by effective_days. For
+    steady-state simulations the behaviour is unchanged.
+    """
     pwu = post_warmup_events(ctx)
     out: list[CheckResult] = []
+    regime = ctx.simulation_regime
+    terminating = ctx.is_terminating
+    window_end = None
+    if terminating and regime.get("arrival_window_seconds") is not None:
+        try:
+            window_end = ctx.warmup + float(regime["arrival_window_seconds"])
+        except (TypeError, ValueError):
+            window_end = None
     for i, spec in enumerate(ctx.spec.get("arrivals", [])):
         etype = spec.get("entity_type")
-        n = len(filter_events(pwu, event="system_arrival", entity_type=etype))
-        observed = n / ctx.effective_days if ctx.effective_days > 0 else 0.0
-        out.append(compare_ratio(observed, spec["expected_rate_per_day"],
-                                 spec.get("tolerance", 0.15),
-                                 f"B01_arrivals[{i}]", "/day"))
+        arrivals = filter_events(pwu, event="system_arrival", entity_type=etype)
+        if window_end is not None:
+            arrivals_in_window = [ev for ev in arrivals
+                                  if float(ev.get("time", 0.0)) <= window_end]
+            n = len(arrivals_in_window)
+            window_days = ctx.rate_measurement_window_days
+            observed = n / window_days if window_days > 0 else 0.0
+            base_result = compare_ratio(
+                observed, spec["expected_rate_per_day"],
+                spec.get("tolerance", 0.15),
+                f"B01_arrivals[{i}]", "/day")
+            # Annotate the diagnostic with the windowing note so the
+            # measurement basis is visible in the report. compare_ratio
+            # returns a CheckResult with (severity, check_name, message,
+            # details). We rebuild the message to include the window
+            # rationale.
+            annotated = CheckResult(
+                severity=base_result.severity,
+                check_name=base_result.check_name,
+                message=(
+                    base_result.message
+                    + f" [regime={regime['type']}: measured over declared "
+                    + f"arrival window of {regime['arrival_window_seconds']}s "
+                    + f"({window_days:.4f} days), not full run_length]"
+                ),
+                details=getattr(base_result, "details", None),
+            )
+            out.append(annotated)
+        else:
+            n = len(arrivals)
+            observed = n / ctx.effective_days if ctx.effective_days > 0 else 0.0
+            out.append(compare_ratio(observed, spec["expected_rate_per_day"],
+                                     spec.get("tolerance", 0.15),
+                                     f"B01_arrivals[{i}]", "/day"))
     if not out:
         out.append(CheckResult("INFO", "B01_arrivals", "No arrival specs; skipped."))
     return out
@@ -485,8 +535,23 @@ def verify_recurring_obligations(ctx: Phase0Context) -> list[CheckResult]:
                             "Exposure = 0; skipped.")]
     out: list[CheckResult] = []
     for i, spec in enumerate(specs):
-        due_every = spec["due_every_hours"]
-        expected = 1.0 / due_every if due_every > 0 else 0.0
+        # AUDIT FIX (H4): the mapper emits due_every_hours directly from the
+        # DSL element (which permits null recurrence_hours), so this value
+        # can legitimately be None. `None > 0` raises TypeError, and with
+        # B01–B17 previously unwrapped that crashed the whole gate. Skip
+        # with INFO — a recurring obligation with no declared cadence has
+        # no rate assertion to verify (same convention as compare_ratio's
+        # None-expected guard).
+        due_every = spec.get("due_every_hours")
+        if due_every is None or (isinstance(due_every, (int, float))
+                                  and due_every <= 0):
+            out.append(CheckResult(
+                "INFO", f"B02_recurring_obligations[{i}]",
+                f"no positive due_every_hours declared "
+                f"(got {due_every!r}); cadence check skipped. Declare a "
+                f"recurrence to enable verification."))
+            continue
+        expected = 1.0 / float(due_every)
         cnt = len(filter_events(pwu, event="service_start",
                                 entity_type=spec.get("entity_type"),
                                 process=spec.get("process"),
@@ -740,6 +805,20 @@ def verify_sequencing(ctx: Phase0Context) -> list[CheckResult]:
     groups = group_by_entity(pwu)
     out: list[CheckResult] = []
     for i, spec in enumerate(ctx.spec.get("sequencing", [])):
+        # AUDIT FIX (H5): the mapper emits "before": None (explicitly) for a
+        # one-sided precedence declaration, and match_event_pattern calls
+        # .items() on the pattern — None crashed the whole gate. A one-sided
+        # precedence has no before/after ordering to verify; skip with INFO.
+        before_pat = spec.get("before")
+        after_pat = spec.get("after")
+        if not isinstance(before_pat, dict) or not isinstance(after_pat, dict):
+            out.append(CheckResult(
+                "INFO", f"B08_sequencing[{i}]",
+                f"one-sided or malformed precedence "
+                f"(before={'set' if isinstance(before_pat, dict) else before_pat!r}, "
+                f"after={'set' if isinstance(after_pat, dict) else after_pat!r}); "
+                f"an ordering check needs both sides — skipped."))
+            continue
         etype = spec.get("entity_type")
         violations = checked = 0
         for _, evs in groups.items():
@@ -748,9 +827,9 @@ def verify_sequencing(ctx: Phase0Context) -> list[CheckResult]:
                 continue
             checked += 1
             idx_b = next((k for k, e in enumerate(rel)
-                          if match_event_pattern(e, spec["before"])), None)
+                          if match_event_pattern(e, before_pat)), None)
             idx_a = next((k for k, e in enumerate(rel)
-                          if match_event_pattern(e, spec["after"])),  None)
+                          if match_event_pattern(e, after_pat)),  None)
             if idx_b is None or idx_a is None:
                 continue
             if idx_a < idx_b:
@@ -832,9 +911,27 @@ def verify_preemption_rules(ctx: Phase0Context) -> list[CheckResult]:
                      if e.get("event") in ("system_departure", "loss")}
         exp_count = spec.get("expected_preempt_count")
         if exp_count is not None:
-            out.append(compare_ratio(float(len(preempts)), float(exp_count),
-                                     spec.get("tolerance", 0.05),
-                                     f"B10_preemption_count[{i}]"))
+            # AUDIT FIX (H1): expected == 0 is the STRONGEST form of the
+            # contract ("preemption must not occur", emitted by the mapper
+            # for interruptible=False). compare_ratio INFO-skips any
+            # expected <= 0, which silently disarmed exactly that case.
+            # Handle zero as an exact assertion, locally — do NOT change
+            # compare_ratio globally (B16/B02 legitimately rely on its
+            # skip semantics for zero/absent expectations).
+            if float(exp_count) == 0.0:
+                sev = "PASS" if len(preempts) == 0 else "FAIL"
+                out.append(CheckResult(
+                    sev, f"B10_preemption_count[{i}]",
+                    (f"declared non-preemptible (expected_preempt_count=0): "
+                     f"{len(preempts)} preempt event(s) observed"
+                     + ("" if sev == "PASS" else
+                        " — preemption occurred on a process declared "
+                        "non-interruptible")),
+                    {"expected": 0, "observed": len(preempts)}))
+            else:
+                out.append(compare_ratio(float(len(preempts)), float(exp_count),
+                                         spec.get("tolerance", 0.05),
+                                         f"B10_preemption_count[{i}]"))
         if spec.get("require_resume_or_terminal_exit", True):
             unpaired = sum(1 for e in preempts
                            if (e["entity_id"], e.get("segment_id")) not in resumes
@@ -873,15 +970,77 @@ def verify_state_transition_rules(ctx: Phase0Context) -> list[CheckResult]:
 
 
 def verify_entity_type_constraints(ctx: Phase0Context) -> list[CheckResult]:
-    """B12: Process/entity_type typing constraints."""
+    """B12: Process/entity_type typing constraints.
+
+    AUDIT FIX (H2): the previous implementation checked only the
+    NEGATIVE form (`not_entity_type`), which the mapper always emits as
+    None and which no DSL field can even express — so the check compared
+    event entity_types against None: vacuous when every event carries a
+    type, spuriously failing when any event lacks one. The POSITIVE form
+    ("process X serves only entity_type A"), which the mapper actually
+    emits under `entity_type`, was never enforced. Both forms are now
+    checked, each only when its field is non-null, and events lacking an
+    entity_type field are counted separately (data-quality note, not a
+    violation).
+    """
     pwu = post_warmup_events(ctx)
     out: list[CheckResult] = []
-    for i, spec in enumerate(ctx.spec.get("entity_type_constraints", [])):
-        proc_evs = [e for e in pwu if e.get("process") == spec["process"]]
-        bad = [e for e in proc_evs if e.get("entity_type") == spec.get("not_entity_type")]
+    specs = ctx.spec.get("entity_type_constraints", [])
+    # Multiple constraints may declare the same process with DIFFERENT
+    # entity_types (e.g. the ER pattern: four acuity classes each pinned to
+    # the shared 'treatment' process). The correct positive semantics is
+    # the per-process UNION of declared types — enforcing each constraint's
+    # single type independently would spuriously fail every multi-type
+    # process. Forbidden types are likewise unioned per process.
+    from collections import defaultdict as _dd
+    allowed_by_proc: dict[str, set] = _dd(set)
+    forbidden_by_proc: dict[str, set] = _dd(set)
+    source_idx: dict[str, list[int]] = _dd(list)
+    for i, spec in enumerate(specs):
+        proc = spec.get("process")
+        if not proc:
+            out.append(CheckResult(
+                "INFO", f"B12_entity_type_constraint[{i}]",
+                "no process declared; nothing to enforce."))
+            continue
+        source_idx[proc].append(i)
+        if spec.get("entity_type") is not None:
+            allowed_by_proc[proc].add(spec["entity_type"])
+        if spec.get("not_entity_type") is not None:
+            forbidden_by_proc[proc].add(spec["not_entity_type"])
+    for proc in sorted(source_idx):
+        allowed = allowed_by_proc.get(proc) or set()
+        forbidden = forbidden_by_proc.get(proc) or set()
+        idxs = source_idx[proc]
+        if not allowed and not forbidden:
+            out.append(CheckResult(
+                "INFO", f"B12_entity_type_constraint[{idxs[0]}]",
+                f"process '{proc}': neither entity_type nor not_entity_type "
+                f"declared; nothing to enforce."))
+            continue
+        proc_evs = [e for e in pwu if e.get("process") == proc]
+        typed_evs = [e for e in proc_evs if e.get("entity_type") is not None]
+        untyped = len(proc_evs) - len(typed_evs)
+        bad: list[dict] = []
+        if allowed:
+            bad.extend(e for e in typed_evs
+                       if e.get("entity_type") not in allowed)
+        if forbidden:
+            bad.extend(e for e in typed_evs
+                       if e.get("entity_type") in forbidden)
         sev = "PASS" if not bad else "FAIL"
-        out.append(CheckResult(sev, f"B12_entity_type_constraint[{i}]",
-                               f"{len(bad)} violations for process '{spec['process']}'."))
+        offending = sorted({str(e.get("entity_type")) for e in bad})[:5]
+        msg = (f"{len(bad)} violations for process '{proc}'"
+               + (f" (allowed={sorted(allowed)})" if allowed else "")
+               + (f" (forbidden={sorted(forbidden)})" if forbidden else "")
+               + (f"; offending types: {offending}" if bad else "")
+               + (f"; {untyped} event(s) lack an entity_type field "
+                  f"(not counted as violations)" if untyped else ""))
+        out.append(CheckResult(
+            sev, f"B12_entity_type_constraint[{idxs[0]}]", msg,
+            {"process": proc, "violations": len(bad), "untyped": untyped,
+             "allowed": sorted(allowed), "forbidden": sorted(forbidden),
+             "merged_spec_indices": idxs}))
     if not out:
         out.append(CheckResult("INFO", "B12_entity_type_constraints",
                                "No entity type constraint specs; skipped."))
@@ -1010,23 +1169,49 @@ def verify_flow_accounting(ctx: Phase0Context) -> list[CheckResult]:
         if ev == "system_arrival":     arrived.add(eid)
         elif ev == "system_departure": departed.add(eid)
         elif ev == "loss":             lost.add(eid)
-    # Only count exits for entities that actually arrived (post-warmup), so a
-    # warmup-straddling exit can't unbalance the books.
+    # AUDIT FIX (C6): the previous formulation computed dep / los / ins as an
+    # exact partition of `arrived` (dep = departed∩arrived, los = the lost
+    # NOT already counted as departed, ins = the remainder), so the balance
+    # identity held BY CONSTRUCTION and the check could never fail — a
+    # tautology. In particular, an entity that both departed AND was lost
+    # (double-termination, a genuine accounting bug) was silently absorbed
+    # into `dep`. We now count terminals NON-exclusively and fail explicitly
+    # on the overlap.
     dep = len(departed & arrived)
-    los = len((lost - departed) & arrived)
+    los = len(lost & arrived)                    # non-exclusive
+    dbl = departed & lost & arrived              # double-terminated entities
     arr = len(arrived)
     ins = len(arrived - departed - lost)
 
     for i, spec in enumerate(ctx.spec.get("flow_accounting", [])):
+        name = spec.get("name", f"spec[{i}]")
+        # (1) Exclusivity: no entity may have BOTH a departure and a loss.
+        if dbl:
+            sample = sorted(str(x) for x in dbl)[:5]
+            out.append(CheckResult(
+                "FAIL", f"B15_{name}",
+                f"{len(dbl)} entit{'y' if len(dbl)==1 else 'ies'} terminated "
+                f"BOTH by departure and by loss (double-termination) — e.g. "
+                f"{sample}. Each entity must end in exactly one terminal "
+                f"outcome; fix the sim's terminal accounting.",
+                {"arrivals": arr, "departures": dep, "losses": los,
+                 "double_terminated": len(dbl),
+                 "double_terminated_sample": sample}))
+            continue
+        # (2) Balance with non-exclusive counts: with the overlap empty this
+        # is a real constraint (dep + los + ins == arr can now genuinely
+        # fail if the trace has orphan exits or accounting drift).
         balanced = abs(arr - (dep + los + ins)) <= 1
         sev = "PASS" if balanced else "FAIL"
-        name = spec.get("name", f"spec[{i}]")
         out.append(CheckResult(sev, f"B15_{name}",
                                f"arrivals={arr} = departures={dep} + losses={los} "
                                f"+ in_system={ins} "
-                               f"(error={abs(arr - dep - los - ins)}); counted from trace.",
+                               f"(error={abs(arr - dep - los - ins)}); counted from "
+                               f"trace with non-exclusive terminal counts; "
+                               f"double-termination checked separately.",
                                {"arrivals": arr, "departures": dep,
-                                "losses": los, "in_system": ins}))
+                                "losses": los, "in_system": ins,
+                                "double_terminated": 0}))
         # Cross-check the sim's self-reported metrics, if present, and flag
         # any disagreement (it points to a sim metrics-accounting bug).
         m_dep = ctx.metrics.get("total_departures")
@@ -1151,22 +1336,34 @@ def run_phase0(result: dict) -> list[CheckResult]:
         return all_results  # gate: broken trace → skip contracts
 
     # ── Layer B (B01–B17) ────────────────────────────────────────────────────
-    all_results += verify_arrivals(ctx)
-    all_results += verify_recurring_obligations(ctx)
-    all_results += verify_service_rates(ctx)
-    all_results += verify_periodic_processes(ctx)
-    all_results += verify_scheduled_windows(ctx)
-    all_results += verify_handoff_sequences(ctx)
-    all_results += verify_coordination_patterns(ctx)
-    all_results += verify_sequencing(ctx)
-    all_results += verify_temporal(ctx)
-    all_results += verify_preemption_rules(ctx)
-    all_results += verify_state_transition_rules(ctx)
-    all_results += verify_entity_type_constraints(ctx)
-    all_results += verify_terminal_outcomes(ctx)
-    all_results += verify_losses(ctx)
-    all_results += verify_flow_accounting(ctx)
-    all_results += verify_aggregate_targets(ctx)
+    # AUDIT FIX (H3): each checker runs inside a try/except that converts a
+    # crash into a BLOCK CheckResult, matching the B24–B41 wrapper. Layer B
+    # previously ran unwrapped, so one malformed spec entry (e.g. a null
+    # cadence or one-sided precedence before those got their own guards)
+    # raised out of run_phase0 entirely — no gate verdict, no per-check
+    # diagnostics, and the self-heal loop had nothing to classify. A crashed
+    # checker is absence of verification, not a pass, hence BLOCK.
+    _layer_b_checks = [
+        verify_arrivals, verify_recurring_obligations, verify_service_rates,
+        verify_periodic_processes, verify_scheduled_windows,
+        verify_handoff_sequences, verify_coordination_patterns,
+        verify_sequencing, verify_temporal, verify_preemption_rules,
+        verify_state_transition_rules, verify_entity_type_constraints,
+        verify_terminal_outcomes, verify_losses, verify_flow_accounting,
+        verify_aggregate_targets,
+    ]
+    for _chk in _layer_b_checks:
+        try:
+            all_results += _chk(ctx)
+        except Exception as _exc:
+            import traceback as _tb
+            all_results.append(CheckResult(
+                "BLOCK", f"B_layer_crash[{_chk.__name__}]",
+                f"{_chk.__name__} raised {_exc!r} — a crashed checker is "
+                f"absence of verification, not a pass. Classify as "
+                f"VALIDATOR_FIX (checker bug) or DSL_SPEC (malformed spec "
+                f"entry) and resolve before trusting this phase.",
+                {"error": str(_exc), "traceback": _tb.format_exc(limit=5)}))
 
     # ── Layer B Extended — Process Contract Validators (B18–B23) ─────────────
     all_results += validate_process_contracts(ctx)

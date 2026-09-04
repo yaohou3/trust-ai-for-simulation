@@ -90,6 +90,58 @@ class Phase0Context:
         return self.effective_time / 86_400.0
 
     @property
+    def simulation_regime(self) -> dict[str, Any]:
+        """Return the declared simulation regime as a normalized dict.
+
+        For terminating/burst simulations, rate-based checks (e.g. B01
+        arrival rate) should measure over the declared arrival window
+        rather than the full effective_time — otherwise the drain-tail
+        dilutes the observed rate. Defaults to steady_state when the
+        field is absent."""
+        reg = (self.config or {}).get("simulation_regime") or {}
+        if not isinstance(reg, dict):
+            return {"type": "steady_state"}
+        t = (reg.get("type") or "steady_state").lower()
+        if t not in ("steady_state", "terminating", "burst"):
+            t = "steady_state"
+        return {
+            "type": t,
+            "arrival_window_seconds": reg.get("arrival_window_seconds"),
+            "total_entities": reg.get("total_entities"),
+            "rationale": reg.get("rationale"),
+        }
+
+    @property
+    def is_terminating(self) -> bool:
+        """True if the declared regime is terminating or burst."""
+        return self.simulation_regime["type"] in ("terminating", "burst")
+
+    @property
+    def rate_measurement_window_seconds(self) -> float:
+        """Time window over which rate-based checks (arrivals, throughput)
+        should measure. For steady-state regimes this is the full
+        effective_time. For terminating/burst regimes with a declared
+        arrival window, this is the arrival window itself — measuring
+        arrival rate over a full run that extends past the arrival window
+        into the drain phase produces an artifactually low observed rate
+        that has no defensible interpretation.
+        """
+        if self.is_terminating:
+            reg = self.simulation_regime
+            w = reg.get("arrival_window_seconds")
+            if w is not None:
+                try:
+                    return max(float(w), 1e-9)
+                except (TypeError, ValueError):
+                    pass
+        return self.effective_time
+
+    @property
+    def rate_measurement_window_days(self) -> float:
+        """Rate-measurement window in days."""
+        return self.rate_measurement_window_seconds / 86_400.0
+
+    @property
     def effective_hours(self) -> float:
         """Post-warmup window expressed as hours (÷ 3 600 s)."""
         return self.effective_time / 3_600.0

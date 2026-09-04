@@ -91,9 +91,64 @@ Seed controls ALL randomness. Config must include compliance_spec derived from D
       declared branch probability.
     • `processes_enabled` ({process: bool}) — toggle an optional process on/off
       (for coupling scenarios), if the model has couplings.
+    • `duration_scale` ({process: float}) — multiply a process's declared mean
+      service time by this factor. Enables the canonical duration_semantics
+      scenario. Default 1.0 per process. Omit if the model has no scalable
+      service times, but note this in `config_overrides_supported`.
+    • `queue_discipline` ({queue: "FIFO" | "priority"}) — override a queue's
+      declared discipline. Enables the canonical queue_discipline scenario.
+      Omit if the queue discipline is fixed by the model's design.
+    • `eligibility_enforced` ({rule_name: bool}) — toggle an eligibility rule
+      on/off. Enables the canonical eligibility_enforcement scenario. Only
+      applies when the model has eligibility_rule elements.
+    • `transition_disabled` ({transition_name: bool}) — disable a declared
+      state transition. Enables the canonical state_transition_sensitivity
+      scenario. Only applies when the model has state_transition_rules.
   These are run-time MULTIPLIERS/overrides layered on top of the declared values;
   they do NOT change the declared parameters themselves (DEFAULT_CONFIG keeps the
   declared numbers), so honoring them is implementation, not a model change.
+- **Honor the standard metric-naming conventions** so canonical scenarios can
+  read the outcomes they probe for. Emit these in `result["metrics"]` when the
+  corresponding structure exists in the model:
+    • `mean_sojourn` or `avg_system_time` (float) — mean per-entity total time
+      in system.
+    • `mean_duration.<process>` (float) — mean service duration per process,
+      one key per process. Enables canonical duration_semantics.
+    • `wait_time_p95.<queue>` (float) — 95th percentile wait per queue, one
+      key per queue.
+    • `wait_time_p95.<queue>.high_priority` (float) — 95th percentile wait
+      for the HIGHEST-priority class at the queue (only for queues with a
+      priority discipline or a priority override). Enables the canonical
+      queue_discipline claim, which tests that priority scheduling reduces
+      the high-priority class's tail wait — the theoretically defensible
+      direction (the queue's overall p95 typically RISES under priority,
+      so it is deliberately not the claim's target).
+    • `utilization.<resource>` (float, 0–1) — mean utilization per resource.
+    • `preemption_count` (int) — total preempt events. Enables canonical
+      preemption_causality.
+    • `transitions.<name>` (int) — count of firings per declared state
+      transition. Enables canonical state_transition_sensitivity.
+    • `eligibility_violations` (int) — count of eligibility-rule violations.
+      Enables canonical eligibility_enforcement.
+    • `loss_rate` (float, 0–1) — fraction of arrivals lost.
+    • `coverage.<entity_type>` (float, 0–1) — coverage fraction per entity
+      type. Enables canonical coverage_guarantees.
+  Metric names not in this list are permitted; the scenario harness reports
+  metric-absent as INCONCLUSIVE for that scenario without failing others.
+- **Declare `simulation_regime` in DEFAULT_CONFIG** when the model is a
+  terminating simulation (finite population, defined end time — MASCAL,
+  mass-casualty, one-off surge, single-shift analysis, any scenario without
+  an intended steady state). Set:
+    • `simulation_regime = {"type": "terminating"}` for a finite-population
+      model with no arrival burst window.
+    • `simulation_regime = {"type": "burst", "arrival_window_seconds": N,
+      "total_entities": N, "rationale": "..."}` for a burst arrival pattern
+      (arrivals concentrated in an initial window followed by a drain phase).
+  Downstream checks (B01 arrival rate, §1.3 utilization identity, §2.3.1
+  extreme_zero_capacity, §3.1.3 MSER-5 warm-up) read this field to adjust
+  their measurement basis or skip when the steady-state assumption does
+  not apply. Steady-state models omit the field or set
+  `{"type": "steady_state"}` (default).
 - After the code, output a manifest between ===MANIFEST_START=== and
   ===MANIFEST_END=== listing entity_types, resources, queues, kpis_implemented,
   semantic_fields_emitted, and config_overrides_supported (list every override

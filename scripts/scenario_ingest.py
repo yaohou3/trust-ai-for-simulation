@@ -113,11 +113,30 @@ def normalize(scn: dict) -> tuple[dict | None, list[str]]:
         return None, [f"Rejected '{name}': non-falsifiable direction {bad} "
                       "(use up/down/unchanged; 'any' asserts nothing)."]
 
-    # Provenance: an LLM-proposed scenario is advisory unless a human approved it.
-    sme = scn.get("sme_approved") is True or (
-        str(scn.get("provenance") or scn.get("source") or "").lower() == "sme_approved")
+    # Provenance — AUDIT FIX (C4): forced to auto_generated UNCONDITIONALLY.
+    # The previous logic read `sme_approved` / `provenance` out of the parsed
+    # block itself — i.e. out of the GENERATOR'S OWN OUTPUT — so one token in
+    # the LLM's response ("sme_approved": true) self-promoted an advisory
+    # scenario to authoritative, magnitude-bearing evidence. Nothing here can
+    # distinguish a human edit from generator output, so nothing here may
+    # grant authority. Everything that flows through ingest is
+    # auto_generated, full stop.
+    #
+    # The legitimate SME-approval path is unaffected: a human expresses
+    # approval by editing the DSL (setting provenance: sme_approved on the
+    # scenario entry in compliance_spec, after review) — that path is read
+    # directly by semantic_scenarios._provenance and never passes through
+    # this function. See RUN_GUIDE "SME approval" and FRAMEWORK_ROUTING D0.
     scn = dict(scn)
-    scn["provenance"] = "sme_approved" if sme else "auto_generated"
+    if (scn.get("sme_approved") is True
+            or str(scn.get("provenance") or scn.get("source") or "").lower()
+            == "sme_approved"):
+        warnings.append(
+            f"{name}: generator output claimed sme_approved — IGNORED. "
+            f"Ingest cannot grant authority; an SME approves by editing the "
+            f"scenario's provenance in the DSL after review.")
+    scn.pop("sme_approved", None)
+    scn["provenance"] = "auto_generated"
 
     # Magnitude licensing: auto_generated is direction-only.
     if scn["provenance"] == "auto_generated":
@@ -141,6 +160,34 @@ def normalize(scn: dict) -> tuple[dict | None, list[str]]:
         if dropped:
             warnings.append(f"{name}: magnitude stripped (auto_generated is "
                             "direction-only).")
+
+    # Evaluation-rigging guard (audit F4): the generator may not weaken its
+    # own statistical test. A scenario-supplied evaluation block with, e.g.,
+    # confidence 0.5 or 10 bootstrap replications makes direction_pass far
+    # easier to mint. Clamp to the harness floors; anything the generator
+    # declared BELOW the floor is discarded with a warning.
+    ev = scn.get("evaluation")
+    if isinstance(ev, dict):
+        clamped = []
+        try:
+            if ev.get("confidence") is not None and float(ev["confidence"]) < 0.90:
+                clamped.append(f"confidence {ev['confidence']}→0.95")
+                ev = {**ev, "confidence": 0.95}
+        except (TypeError, ValueError):
+            clamped.append(f"confidence {ev.get('confidence')!r}→0.95")
+            ev = {**ev, "confidence": 0.95}
+        try:
+            if ev.get("replications") is not None and int(ev["replications"]) < 1000:
+                clamped.append(f"replications {ev['replications']}→2000")
+                ev = {**ev, "replications": 2000}
+        except (TypeError, ValueError):
+            clamped.append(f"replications {ev.get('replications')!r}→2000")
+            ev = {**ev, "replications": 2000}
+        if clamped:
+            scn["evaluation"] = ev
+            warnings.append(f"{name}: evaluation block clamped "
+                            f"({'; '.join(clamped)}) — a generated scenario "
+                            f"may not weaken its own statistical test.")
     return scn, warnings
 
 

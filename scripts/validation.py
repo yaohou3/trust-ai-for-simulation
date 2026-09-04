@@ -209,6 +209,66 @@ def _resources_from_config(cfg: dict) -> dict[str, dict]:
     return norm
 
 
+def _simulation_regime(cfg: dict) -> dict:
+    """Return the declared simulation regime as a normalized dict.
+
+    Reads ``cfg['simulation_regime']`` and returns a dict with at least
+    ``type`` present. Defaults to ``{'type': 'steady_state'}`` when the
+    field is absent, preserving backward compatibility with existing
+    models that do not declare a regime.
+
+    Downstream checks that assume steady-state behaviour (Little's Law
+    utilization identity §1.3, extreme-capacity divergence §2.3.1,
+    warm-up detection §3.1.3, arrival-rate windowing B01) should consult
+    this via :func:`_is_terminating` to decide whether to apply their
+    steady-state variant, apply a terminating-aware variant, or skip
+    with INFO.
+
+    See the Sargent-canonical distinction between terminating and
+    non-terminating simulations. MASCAL / mass-casualty and other
+    single-incident burst systems are terminating; ICU digital-twin
+    and manufacturing continuous-flow systems are non-terminating.
+    """
+    reg = cfg.get("simulation_regime") or {}
+    if not isinstance(reg, dict):
+        return {"type": "steady_state"}
+    t = (reg.get("type") or "steady_state").lower()
+    if t not in ("steady_state", "terminating", "burst"):
+        t = "steady_state"
+    return {
+        "type": t,
+        "arrival_window_seconds": reg.get("arrival_window_seconds"),
+        "total_entities": reg.get("total_entities"),
+        "rationale": reg.get("rationale"),
+    }
+
+
+def _is_terminating(cfg: dict) -> bool:
+    """True if the simulation regime is ``terminating`` or ``burst``.
+
+    A helper distinct from :func:`_simulation_regime` so that the intent
+    at the call site is clear: *"skip the steady-state variant of this
+    check when the declared regime is terminating."*"""
+    return _simulation_regime(cfg)["type"] in ("terminating", "burst")
+
+
+def _arrival_window_seconds(cfg: dict) -> float | None:
+    """For burst regimes, return the declared arrival window in seconds.
+
+    Rate-based checks (B01, §1.3 utilization) that need to distinguish
+    the arrival-active period from a subsequent drain phase use this to
+    select a measurement basis narrower than the full ``run_length``.
+    Returns None when no window is declared."""
+    reg = _simulation_regime(cfg)
+    w = reg.get("arrival_window_seconds")
+    if w is None:
+        return None
+    try:
+        return float(w)
+    except (TypeError, ValueError):
+        return None
+
+
 def _resource_capacity(cfg: dict, name: str) -> int | None:
     res = _resources_from_config(cfg)
     if name in res:
@@ -529,25 +589,41 @@ def validate_phase1(sim_module, config: dict | None = None,
     # exit event without a matching arrival can't push the balance negative
     # and FAIL a legitimate trace. A genuine orphan exit (exit with no arrival)
     # is itself a defect — surface it explicitly rather than as a balance error.
+    # AUDIT FIX (C6): the previous formulation derived terminal_loss and
+    # in_system as an exact partition of arr_set, so bal == 0 held by
+    # construction and only orphan_exits could fail the check. A
+    # double-terminated entity (both departure and loss) was silently
+    # absorbed into D. We now surface double-termination explicitly and
+    # count terminals non-exclusively so the balance is a real constraint.
     dep_arrived = dep_set & arr_set
     loss_arrived = loss_set & arr_set
     orphan_exits = (dep_set | loss_set) - arr_set
-    terminal_loss = loss_arrived - dep_arrived
-    in_system = arr_set - dep_arrived - terminal_loss
-    A, D, L, I = len(arr_set), len(dep_arrived), len(terminal_loss), len(in_system)
-    bal = A - D - L - I
-    cons_ok = (bal == 0 and not orphan_exits)
+    double_terminated = dep_arrived & loss_arrived
+    in_system = arr_set - dep_arrived - loss_arrived
+    A, D, L, I = (len(arr_set), len(dep_arrived), len(loss_arrived),
+                  len(in_system))
+    # Non-exclusive counting: D + L double-counts the overlap, so the true
+    # identity is A = D + L - |overlap| + I. With the overlap required to be
+    # empty, this reduces to the declared A = D + L + I.
+    bal = A - D - L + len(double_terminated) - I
+    cons_ok = (bal == 0 and not orphan_exits and not double_terminated)
     diag = f"A={A} = D={D} + L_terminal={L} + I(T)={I}; balance={bal}"
     if orphan_exits:
         diag += f"; {len(orphan_exits)} exit event(s) with no matching arrival"
+    if double_terminated:
+        diag += (f"; {len(double_terminated)} entit"
+                 f"{'y' if len(double_terminated)==1 else 'ies'} terminated "
+                 f"BOTH by departure and loss (double-termination)")
     records.append(CheckRecord(
         check_id="1.1.2_set_based_conservation",
         status="PASS" if cons_ok else "FAIL",
         diagnostic=diag,
         evidence={"A": A, "D": D, "L_terminal": L, "I_T": I, "balance": bal,
-                  "orphan_exits": len(orphan_exits)},
-        suspected_location=("sim_module (resource leak, duplicate departure, or exit "
-                            "without arrival)") if not cons_ok else None,
+                  "orphan_exits": len(orphan_exits),
+                  "double_terminated": len(double_terminated)},
+        suspected_location=("sim_module (resource leak, duplicate departure, "
+                            "double-terminated entity, or exit without arrival)")
+                            if not cons_ok else None,
     ))
 
     # 1.1.3 entity_lifecycle
@@ -781,24 +857,65 @@ def validate_phase1(sim_module, config: dict | None = None,
             E_S = statistics.mean(durations)
             n_starts = sum(1 for ev in trace
                            if ev.get("event") == "service_start" and ev.get("resource") == r)
-            lam_r = n_starts / horizon
+            # Terminating/burst regime: the arrival process is not stationary
+            # over the full horizon. λ×S̄/c is a steady-state identity that
+            # assumes constant λ; comparing against a burst-arrival system's
+            # measured utilization produces a boundary artifact rather than a
+            # meaningful discrepancy. Windowed λ (arrivals ÷ window) restores
+            # apples-to-apples with the observed utilization computed over
+            # the same window.
+            regime = _simulation_regime(base_cfg)
+            arrival_window = _arrival_window_seconds(base_cfg)
+            terminating = regime["type"] in ("terminating", "burst")
+            window = (arrival_window if (terminating and arrival_window
+                                          and arrival_window > 0)
+                      else horizon)
+            n_starts_window = (
+                sum(1 for ev in trace
+                    if ev.get("event") == "service_start"
+                    and ev.get("resource") == r
+                    and float(ev.get("time", 0.0)) <= warmup_t + window)
+                if terminating and arrival_window else n_starts)
+            lam_r = n_starts_window / window
             rho_pred = lam_r * E_S / cap
             busy = _busy_time(intervals)
             rho_obs = busy / (cap * horizon)
             err_u = abs(rho_obs - rho_pred)
-            if err_u <= 0.005:
-                util_status = "PASS"
-            elif err_u <= 0.05:
-                util_status = "WARN"
+            if terminating:
+                # For terminating regimes, the identity is advisory rather
+                # than trust-bearing. WARN is the max severity even for
+                # large discrepancies; the burden of proof shifts to the
+                # windowed check reported below.
+                if err_u <= 0.05:
+                    util_status = "PASS"
+                else:
+                    util_status = "WARN"
+                diag_regime_note = (
+                    f" [terminating regime: λ measured over arrival window "
+                    f"of {window:.0f}s; ρ_obs measured over full horizon "
+                    f"{horizon:.0f}s — a residual is expected and does not "
+                    f"indicate a defect unless it far exceeds the drain-tail "
+                    f"contribution]"
+                )
             else:
-                util_status = "FAIL"
+                if err_u <= 0.005:
+                    util_status = "PASS"
+                elif err_u <= 0.05:
+                    util_status = "WARN"
+                else:
+                    util_status = "FAIL"
+                diag_regime_note = ""
             records.append(CheckRecord(
                 check_id=f"1.3.{r}.util_identity",
                 status=util_status,
-                diagnostic=(f"{r}: util={rho_obs:.4f} = λ×S̄/c = ({n_starts}/{horizon:.2f})"
-                            f"×{E_S:.3f}/{cap} = {rho_pred:.4f}; abs_err={err_u:.4f}"),
+                diagnostic=(f"{r}: util={rho_obs:.4f} = λ×S̄/c = ({n_starts_window}/{window:.2f})"
+                            f"×{E_S:.3f}/{cap} = {rho_pred:.4f}; abs_err={err_u:.4f}"
+                            f"{diag_regime_note}"),
                 evidence={"util_observed": rho_obs, "util_predicted": rho_pred,
-                          "abs_error": err_u, "n_starts": n_starts, "E_S": E_S, "capacity": cap},
+                          "abs_error": err_u, "n_starts": n_starts_window,
+                          "E_S": E_S, "capacity": cap,
+                          "regime": regime["type"],
+                          "measurement_window_seconds": window},
                 suspected_location=(f"sim_module (resource '{r}' service-time emission "
                                     "or busy-time accounting)") if util_status == "FAIL" else None,
             ))
@@ -1978,7 +2095,32 @@ def validate_phase2(sim_module, config: dict | None = None,
     # the library can run, and produces a meaningful PASS/FAIL rather than a
     # WARN that depends on whether the library can represent the boundary
     # point exactly.
-    res_cfg = _resources_from_config(base_cfg)
+    #
+    # Regime-awareness: the "unbounded queue divergence at extreme low
+    # capacity" expectation is a steady-state property. A terminating or
+    # burst simulation has a finite arrival population that drains
+    # eventually even at cap=1 — a correctly-modeled MASCAL system does
+    # not diverge, so the check cannot distinguish "correctly-modeled
+    # terminating system" from "broken model." For terminating regimes,
+    # we skip with INFO rather than emit a WARN that has no defensible
+    # interpretation.
+    _zc_regime = _simulation_regime(base_cfg)
+    if _zc_regime["type"] in ("terminating", "burst"):
+        records.append(CheckRecord(
+            check_id="2.3.1_extreme_zero_capacity",
+            status="INFO",
+            diagnostic=(
+                f"Extreme-zero-capacity divergence is a steady-state "
+                f"property; skipped for regime={_zc_regime['type']!r}. "
+                f"A finite terminating burst drains eventually even at "
+                f"cap=1 without diverging, so this check cannot "
+                f"discriminate credible from broken models here."
+            ),
+            evidence={"regime": _zc_regime["type"]},
+        ))
+        res_cfg = {}  # skip the loop body below
+    else:
+        res_cfg = _resources_from_config(base_cfg)
     if res_cfg:
         rname = next(iter(res_cfg))
         cfg_zc = dict(base_cfg)
@@ -2239,9 +2381,15 @@ def validate_phase2(sim_module, config: dict | None = None,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _replication_kpi_series(sim_module, base_cfg: dict, seeds: list[int],
-                            window_size: float | None = None) -> list[list[float]]:
+                            window_size: float | None = None,
+                            records: list | None = None) -> list[list[float]]:
     """Run N replications; return per-rep list of bin-averaged in-system census
-    over equal-width time windows. Used by Welch's procedure and MSER-5."""
+    over equal-width time windows. Used by Welch's procedure and MSER-5.
+
+    AUDIT FIX (M3): a replication that crashes is no longer silently dropped
+    — when a `records` list is supplied, the BLOCK CheckRecord is appended
+    so a sim that crashes on some seeds is visible in the phase report
+    rather than just thinning the Welch sample."""
     horizon_default = base_cfg.get("run_length", 100.0)
     if window_size is None:
         window_size = horizon_default / 50.0
@@ -2250,6 +2398,8 @@ def _replication_kpi_series(sim_module, base_cfg: dict, seeds: list[int],
         cfg_r = dict(base_cfg); cfg_r["seed"] = s
         result, block = _safe_run(sim_module, cfg_r, f"3.1.x_rep{s}", f"welch_rep_{s}")
         if block:
+            if records is not None:
+                records.append(block)
             continue
         trace = result.get("trace", [])
         # bin in-system count over windows
@@ -2383,7 +2533,8 @@ def validate_phase3(sim_module, config: dict | None = None,
     # 3.1.2 welch_method — use all available replications (capped by what was
     # actually requested), not a hard-coded 3.
     welch_seeds = [base_cfg.get("seed", 42) + i for i in range(max(n_replications, 2))]
-    series = _replication_kpi_series(sim_module, base_cfg, welch_seeds)
+    series = _replication_kpi_series(sim_module, base_cfg, welch_seeds,
+                                     records=records)
     if len(series) >= 2:
         d_welch = _welch_truncation(series, window=5)
         n_bins = min(len(s) for s in series)
@@ -2418,8 +2569,25 @@ def validate_phase3(sim_module, config: dict | None = None,
             evidence={"available_reps": len(series)},
         ))
 
-    # 3.1.3 mser5_method
-    if series:
+    # 3.1.3 mser5_method — warm-up truncation detection.
+    # Terminating regimes have no meaningful steady state to warm past.
+    # A declared warmup_time=0 for a terminating simulation is a correct
+    # declaration, not an omission. Applying MSER-5 pushes the "truncation
+    # point" arbitrarily late (95%+ in the MASCAL case) rather than
+    # recognizing that no truncation is applicable. Skip with INFO.
+    _mser_regime = _simulation_regime(base_cfg)
+    if _mser_regime["type"] in ("terminating", "burst"):
+        records.append(CheckRecord(
+            check_id="3.1.3_mser5_method",
+            status="INFO",
+            diagnostic=(
+                f"MSER-5 warm-up truncation is not applicable to "
+                f"regime={_mser_regime['type']!r} — no steady state to "
+                f"warm past. Skipped."
+            ),
+            evidence={"regime": _mser_regime["type"]},
+        ))
+    elif series:
         avg_series = [statistics.mean(s[i] for s in series)
                       for i in range(min(len(s) for s in series))]
         d_mser = _mser(avg_series)
@@ -2530,8 +2698,12 @@ def validate_phase3(sim_module, config: dict | None = None,
                 if isinstance(sd_pb[k], dict) and "mean" in sd_pb[k]:
                     sd_pb[k] = dict(sd_pb[k]); sd_pb[k]["mean"] = sd_pb[k]["mean"] * 1.5
             cfg_pb["service_distributions"] = sd_pb
-        ra2, _ = _safe_run(sim_module, cfg_pa, "3.3.2_pair_a", "crn_arr_a")
-        rb2, _ = _safe_run(sim_module, cfg_pb, "3.3.2_pair_b", "crn_arr_b")
+        ra2, _b1 = _safe_run(sim_module, cfg_pa, "3.3.2_pair_a", "crn_arr_a")
+        rb2, _b2 = _safe_run(sim_module, cfg_pb, "3.3.2_pair_b", "crn_arr_b")
+        # AUDIT FIX (M3): surface crashed perturbed runs instead of dropping.
+        for _blk in (_b1, _b2):
+            if _blk:
+                records.append(_blk)
         if ra2 and rb2:
             arr_a = _arrival_times(ra2.get("trace", []))
             arr_b = _arrival_times(rb2.get("trace", []))
@@ -2566,8 +2738,11 @@ def validate_phase3(sim_module, config: dict | None = None,
             arr_t_dict = dict(cfg_t["arrival_distribution"])
             arr_t_dict["rate"] = arr_t_dict["rate"] * 1.2
             cfg_t["arrival_distribution"] = arr_t_dict
-        rc, _ = _safe_run(sim_module, cfg_c, "3.3.3_pc", "crn_pair_c")
-        rt, _ = _safe_run(sim_module, cfg_t, "3.3.3_pt", "crn_pair_t")
+        rc, _b3 = _safe_run(sim_module, cfg_c, "3.3.3_pc", "crn_pair_c")
+        rt, _b4 = _safe_run(sim_module, cfg_t, "3.3.3_pt", "crn_pair_t")
+        for _blk in (_b3, _b4):
+            if _blk:
+                records.append(_blk)   # AUDIT FIX (M3)
         if rc and rt:
             sc = _entity_sojourn(rc.get("trace", []))
             st = _entity_sojourn(rt.get("trace", []))
@@ -2580,8 +2755,11 @@ def validate_phase3(sim_module, config: dict | None = None,
             arr_t2_dict = dict(cfg_t2["arrival_distribution"])
             arr_t2_dict["rate"] = arr_t2_dict["rate"] * 1.2
             cfg_t2["arrival_distribution"] = arr_t2_dict
-        rc2, _ = _safe_run(sim_module, cfg_c2, "3.3.3_uc", "crn_unpair_c")
-        rt2, _ = _safe_run(sim_module, cfg_t2, "3.3.3_ut", "crn_unpair_t")
+        rc2, _b5 = _safe_run(sim_module, cfg_c2, "3.3.3_uc", "crn_unpair_c")
+        rt2, _b6 = _safe_run(sim_module, cfg_t2, "3.3.3_ut", "crn_unpair_t")
+        for _blk in (_b5, _b6):
+            if _blk:
+                records.append(_blk)   # AUDIT FIX (M3)
         if rc2 and rt2:
             sc2 = _entity_sojourn(rc2.get("trace", []))
             st2 = _entity_sojourn(rt2.get("trace", []))
@@ -2633,8 +2811,13 @@ def validate_phase3(sim_module, config: dict | None = None,
         cfg_base = dict(base_cfg)
         cfg_pert = dict(base_cfg)
         cfg_pert["arrival_distribution"] = dict(arr_s); cfg_pert["arrival_distribution"][key] = arr_s[key] * 1.2
-        rb_, _ = _safe_run(sim_module, cfg_base, "3.4.2_base", "sens_base")
-        rp_, _ = _safe_run(sim_module, cfg_pert, "3.4.2_pert", "sens_pert")
+        rb_, _b7 = _safe_run(sim_module, cfg_base, "3.4.2_base", "sens_base")
+        rp_, _b8 = _safe_run(sim_module, cfg_pert, "3.4.2_pert", "sens_pert")
+        for _blk in (_b7, _b8):
+            if _blk:
+                records.append(_blk)   # AUDIT FIX (M3): a sim that crashes
+                # only under a +20% arrival perturbation is a robustness red
+                # flag, not something to silently omit.
         if rb_ and rp_:
             sb_ = _entity_sojourn(rb_.get("trace", []))
             sp_ = _entity_sojourn(rp_.get("trace", []))
@@ -2715,8 +2898,11 @@ def validate_phase3(sim_module, config: dict | None = None,
         cfg_b3 = dict(base_cfg); cfg_b3["seed"] = base_cfg.get("seed", 42)
         cfg_p3 = dict(base_cfg); cfg_p3["seed"] = base_cfg.get("seed", 42)
         cfg_p3[secondary_key] = pert
-        rb3, _ = _safe_run(sim_module, cfg_b3, "3.4.3_base", "sens2_base")
-        rp3, _ = _safe_run(sim_module, cfg_p3, "3.4.3_pert", "sens2_pert")
+        rb3, _b9 = _safe_run(sim_module, cfg_b3, "3.4.3_base", "sens2_base")
+        rp3, _b10 = _safe_run(sim_module, cfg_p3, "3.4.3_pert", "sens2_pert")
+        for _blk in (_b9, _b10):
+            if _blk:
+                records.append(_blk)   # AUDIT FIX (M3)
         if rb3 and rp3:
             # Compare every numeric KPI between the two runs; report the
             # largest signed fractional change.
@@ -2879,14 +3065,52 @@ def validate_phase4(sim_module, config: dict | None = None) -> PhaseReport:
         ))
     else:
         # 4.2.1 preemption_fires
+        # If the declared preemption_rules explicitly forbid initiation
+        # (e.g. `can_initiate: False` on every rule, or `interruptible: False`
+        # on every service_process), then observing zero preempts is the
+        # correct behaviour, not evidence of an omission. B10 already
+        # handles this in Phase 0; §4.2.1 mirrors that logic so a declared
+        # non-preemptive system does not accumulate a spurious WARN.
+        def _preemption_forbidden_by_declaration(cfg: dict) -> bool:
+            pr = cfg.get("preemption_rules") or []
+            _cs = (cfg.get("compliance_spec") or {}) if isinstance(cfg, dict) else {}
+            pr = list(pr) + list(_cs.get("preemption_rules") or [])
+            if not pr:
+                return False
+            # If any rule permits initiation, preemption is expected.
+            for rule in pr:
+                if not isinstance(rule, dict):
+                    continue
+                ci = rule.get("can_initiate")
+                if ci is True or ci is None:
+                    # can_initiate=None means unspecified (defaults to True);
+                    # only explicit False on every rule suffices.
+                    return False
+            return True
+
+        preempts_forbidden = _preemption_forbidden_by_declaration(base_cfg)
+        if not preempts and preempts_forbidden:
+            fires_status = "PASS"
+            fires_diag = (
+                "0 preempt events observed — consistent with declaration: "
+                "every declared preemption_rule has can_initiate=False "
+                "(preemption is forbidden by design, not omitted)."
+            )
+        elif preempts:
+            fires_status = "PASS"
+            fires_diag = f"{len(preempts)} preempt + {len(resumes)} resume events observed"
+        else:
+            fires_status = "WARN"
+            fires_diag = (
+                "preemption declared but no preempt events observed in this run "
+                "(may be a low-contention regime, not necessarily a defect)"
+            )
         records.append(CheckRecord(
             check_id="4.2.1_preemption_fires",
-            status="PASS" if preempts else "WARN",
-            diagnostic=(f"{len(preempts)} preempt + {len(resumes)} resume events observed"
-                        if preempts else
-                        "preemption declared but no preempt events observed in this run "
-                        "(may be a low-contention regime, not necessarily a defect)"),
-            evidence={"preempts": len(preempts), "resumes": len(resumes)},
+            status=fires_status,
+            diagnostic=fires_diag,
+            evidence={"preempts": len(preempts), "resumes": len(resumes),
+                      "declared_non_preemptive": preempts_forbidden},
         ))
 
         # 4.2.2 preemption_priority_only — the takeover must be higher priority
@@ -3002,6 +3226,8 @@ def validate_phase4(sim_module, config: dict | None = None) -> PhaseReport:
         below = 0
         checked = 0
         min_ratio = None
+        abandoned_unresolvable = 0   # AUDIT FIX (M4): terminal preempts of
+        # never-completed segments — ratio undefined, reported separately.
         # Per-violation records, retained for residual fingerprinting and
         # architectural-implication tagging. Each entry corresponds to one
         # preempt that violated the declared barrier.
@@ -3025,12 +3251,27 @@ def validate_phase4(sim_module, config: dict | None = None) -> PhaseReport:
             if total_served <= 0:
                 continue
             seg_start_time = intervals[0][0] if intervals else None
-            # For each preempt in this segment, accumulate served-so-far and
-            # compute the served fraction at that preempt instant.
+            # AUDIT FIX (M4): abandon-path blind spot. When a segment's LAST
+            # closing event is a preempt with no subsequent resume →
+            # service_end (abandonment), that final preempt has
+            # served_so_far == total_served, i.e. ratio 1.0 BY CONSTRUCTION
+            # — it could never register as a barrier violation no matter how
+            # early it fired, and its 1.0 also polluted min_ratio/INERT
+            # detection. The true denominator (intended service duration) is
+            # unknowable from the trace for an abandoned segment, so the
+            # final preempt of a segment that never completes is EXCLUDED
+            # from the ratio test and counted separately as unresolvable.
+            segment_completed = intervals[-1][2] == "service_end"
             served_so_far = 0.0
-            for s, e, closing in intervals:
+            n_intervals = len(intervals)
+            for idx, (s, e, closing) in enumerate(intervals):
                 served_so_far += max(0.0, e - s)
                 if closing == "preempt":
+                    is_terminal_preempt = (idx == n_intervals - 1
+                                           and not segment_completed)
+                    if is_terminal_preempt:
+                        abandoned_unresolvable += 1
+                        continue
                     ratio = served_so_far / total_served
                     if min_ratio is None or ratio < min_ratio:
                         min_ratio = ratio
@@ -3050,11 +3291,20 @@ def validate_phase4(sim_module, config: dict | None = None) -> PhaseReport:
         if checked == 0:
             records.append(CheckRecord(
                 check_id="4.2.3_preemption_barrier",
-                status="INFO",
-                diagnostic=("No barrier-bearing preempts could be reconstructed from "
-                            "trace event timing (missing segment_id, no completed "
-                            "preempt→resume→service_end triples, or no preempts at all)."),
-                evidence={"barrier": barrier, "preempts_seen": len(preempts)},
+                status="INFO" if abandoned_unresolvable == 0 else "WARN",
+                diagnostic=(
+                    "No barrier-bearing preempts could be reconstructed from "
+                    "trace event timing (missing segment_id, no completed "
+                    "preempt→resume→service_end triples, or no preempts at all)."
+                    + (f" NOTE: {abandoned_unresolvable} preempt(s) belong to "
+                       f"never-completed (abandoned) segments whose served "
+                       f"fraction is unresolvable from the trace — the barrier "
+                       f"declaration is UNVERIFIED for these, not satisfied. "
+                       f"Emit resume/service_end (or declare the intended "
+                       f"duration) to make them checkable."
+                       if abandoned_unresolvable else "")),
+                evidence={"barrier": barrier, "preempts_seen": len(preempts),
+                          "abandoned_unresolvable": abandoned_unresolvable},
             ))
         else:
             status = "PASS" if below == 0 else "FAIL"
@@ -3094,13 +3344,20 @@ def validate_phase4(sim_module, config: dict | None = None) -> PhaseReport:
                     f"{min_ratio:.4f}). "
                     f"{'all satisfy barrier' if below == 0 else 'barrier violations present'}"
                     f"{inert_note}"
-                    f"{residual_extension}"
+                    + (f" [{abandoned_unresolvable} terminal preempt(s) of "
+                       f"never-completed (abandoned) segments EXCLUDED — "
+                       f"their served fraction is unresolvable from the "
+                       f"trace; declare the intended duration or emit "
+                       f"resume/service_end to make them checkable]"
+                       if abandoned_unresolvable else "")
+                    + f"{residual_extension}"
                 ),
                 evidence={
                     "barrier": barrier,
                     "min_served_fraction": min_ratio,
                     "below_count": below,
                     "checked": checked,
+                    "abandoned_unresolvable": abandoned_unresolvable,
                     "inert_parameter": inert,
                     "residual_clusters": residual_clusters_dict,
                     "architectural_implication": implication_dict,

@@ -188,9 +188,18 @@ def classify_residual_barrier(
 ) -> list[ClusterReport]:
     """Cluster §4.2.3 violation records by fingerprint.
 
-    Returns clusters sorted by count descending. A cluster is marked
-    ``structural=True`` when its fingerprint is in the structural set AND
-    its share of the residual is at least ``dominance_threshold``.
+    Returns clusters sorted by count descending.
+
+    AUDIT FIX (M5): a cluster is marked ``structural=True`` by FINGERPRINT
+    ALONE — whether the residual pattern is structural-class is a property
+    of the failure mechanism, not of how much of the residual it currently
+    explains. The previous coupling (structural required share ≥ 0.75)
+    made a 70%-same-tick residual read as "no structural cluster", which
+    routed the implication to PARAMETRIC_TUNING_PROMISING — the OPPOSITE
+    of correct guidance — and left the MIXED branch unreachable dead code.
+    Share is now used only downstream, by
+    :func:`architectural_implication_for_barrier`, to split dominant-
+    structural from mixed from parametric.
     """
     if not violations:
         return []
@@ -205,8 +214,7 @@ def classify_residual_barrier(
     for fp, vs in sorted(groups.items(), key=lambda kv: -len(kv[1])):
         count = len(vs)
         share = count / total
-        is_structural_fp = fp in _STRUCTURAL_BARRIER_FINGERPRINTS
-        structural = is_structural_fp and share >= dominance_threshold
+        structural = fp in _STRUCTURAL_BARRIER_FINGERPRINTS
         examples = [
             {
                 "entity_id": v.entity_id,
@@ -236,13 +244,13 @@ def architectural_implication_for_barrier(
 ) -> ImplicationTag:
     """Map residual cluster structure to an architectural-implication tag for §4.2.3.
 
-    Decision rules:
-      - dominant cluster is structural (same_tick or near_tick) →
-        MECHANISM_INTERCEPTION_REQUIRED
-      - no structural cluster present, residual dispersed →
-        PARAMETRIC_TUNING_PROMISING
-      - structural cluster present but not dominant →
-        MIXED_STRUCTURAL_AND_PARAMETRIC
+    Decision rules (AUDIT FIX M5 — share thresholds live HERE, not in the
+    cluster classification, so a sub-dominant structural residual routes to
+    MIXED instead of the previously-wrong PARAMETRIC_TUNING_PROMISING):
+      - total structural share ≥ 0.75 AND the dominant cluster is
+        structural → MECHANISM_INTERCEPTION_REQUIRED (per-fingerprint text)
+      - total structural share in (0.25, 0.75) → MIXED_STRUCTURAL_AND_PARAMETRIC
+      - total structural share ≤ 0.25 → PARAMETRIC_TUNING_PROMISING
     """
     if not clusters:
         return ImplicationTag(
@@ -253,8 +261,10 @@ def architectural_implication_for_barrier(
             iteration_signal="",
         )
     dominant = clusters[0]
+    structural_share = sum(c.share for c in clusters if c.structural)
+    dominant_structural = dominant.structural and structural_share >= 0.75
 
-    if dominant.structural and dominant.fingerprint == "same_tick+served_zero":
+    if dominant_structural and dominant.fingerprint == "same_tick+served_zero":
         return ImplicationTag(
             tag="MECHANISM_INTERCEPTION_REQUIRED",
             description=(
@@ -291,7 +301,7 @@ def architectural_implication_for_barrier(
         )
 
     if (
-        dominant.structural
+        dominant_structural
         and dominant.fingerprint == "near_tick+served_below_10pct_of_barrier"
     ):
         return ImplicationTag(
@@ -317,17 +327,16 @@ def architectural_implication_for_barrier(
             ),
         )
 
-    if any(c.structural for c in clusters):
-        struct_share = sum(c.share for c in clusters if c.structural)
+    if structural_share > 0.25:
         return ImplicationTag(
             tag="MIXED_STRUCTURAL_AND_PARAMETRIC",
             description=(
-                "Residual contains both a structural cluster (same-tick races) "
-                f"summing to {struct_share:.0%} of violations and a parametric tail. "
-                "Address the structural component first by changing the "
-                "preempt-decision mechanism; the parametric tail may then close "
-                "under the new mechanism, or remain as a smaller residual that "
-                "parametric tuning can address."
+                "Residual contains a structural component (same-tick races) "
+                f"summing to {structural_share:.0%} of violations plus a "
+                "parametric tail. Address the structural component first by "
+                "changing the preempt-decision mechanism; the parametric tail "
+                "may then close under the new mechanism, or remain as a "
+                "smaller residual that parametric tuning can address."
             ),
             compatible_patterns=[
                 "Replace the preempt-decision mechanism first; re-measure parametric "
@@ -337,13 +346,14 @@ def architectural_implication_for_barrier(
                 "Tuning parameters alone cannot close the structural component."
             ],
             iteration_signal=(
-                f"Residual mixes structural ({struct_share:.0%}) and parametric "
-                f"violations. Mechanism change required before further parametric "
-                f"tuning."
+                f"Residual mixes structural ({structural_share:.0%}) and "
+                f"parametric violations. Mechanism change required before "
+                f"further parametric tuning — do NOT read a declining count "
+                f"as convergence while the structural share persists."
             ),
         )
 
-    # No structural cluster — residual is dispersed
+    # Structural share negligible (≤ 25%) — residual is parametric-dominated
     return ImplicationTag(
         tag="PARAMETRIC_TUNING_PROMISING",
         description=(

@@ -57,7 +57,18 @@ def _worst(*verdicts: str) -> str:
 # ── Credibility (Phases 0–4) ───────────────────────────────────────────────
 def credibility(phase_statuses: dict) -> dict:
     """Worst-of across Phases 0–4. ``phase_statuses`` keys may be '0'..'4' or
-    'phase0'..'phase4'; values are PASS/WARN/FAIL/BLOCK (INFO treated as PASS)."""
+    'phase0'..'phase4'; values are PASS/WARN/FAIL/BLOCK (INFO treated as PASS).
+
+    AUDIT FIX (C8): this roll-up must FAIL CLOSED, not open.
+      • A phase whose status is unknown / blank / unparseable maps to
+        NOT_EXERCISED, never PASS — an unrecognised status is absence of
+        evidence, not evidence.
+      • ALL FIVE phases must be present. A missing phase also maps to
+        NOT_EXERCISED (with its own reason), so ``{"0": "PASS"}`` alone can
+        no longer yield "All of Phases 0–4 PASS."
+    INFO alone remains PASS: it is an affirmative "check ran, informational
+    only" status emitted by the validators, not an absence of evidence.
+    """
     norm: dict[str, str] = {}
     for k, v in (phase_statuses or {}).items():
         key = str(k).replace("phase", "")
@@ -68,9 +79,20 @@ def credibility(phase_statuses: dict) -> dict:
                 "reasons": ["No Phase 0–4 results provided."]}
     worst = "PASS"
     bad: list[str] = []
-    for k in sorted(considered):
-        raw = considered[k]
-        v = raw if raw in _RANK else "PASS"   # INFO / blank / unknown → PASS
+    for k in ("0", "1", "2", "3", "4"):
+        if k not in considered:
+            v = "NOT_EXERCISED"
+            bad.append(f"Phase {k}=MISSING (treated as NOT_EXERCISED)")
+        else:
+            raw = considered[k]
+            if raw == "INFO":
+                v = "PASS"
+            elif raw in _RANK:
+                v = raw
+            else:
+                v = "NOT_EXERCISED"
+                bad.append(f"Phase {k}={raw or 'BLANK'!r} (unrecognised status; "
+                           f"treated as NOT_EXERCISED)")
         if _RANK[v] > _RANK[worst]:
             worst = v
         if v in ("WARN", "FAIL", "BLOCK"):
@@ -215,16 +237,45 @@ def render(report: dict) -> str:
 
 
 def _statuses_from_vvuq_out(out_dir: str) -> dict:
+    """Read per-phase statuses from a vvuq_out directory.
+
+    AUDIT FIX (C8): two fail-open behaviours corrected.
+      • Phase 0 reports do not carry a top-level ``status`` field — they
+        carry ``gate`` ("OPEN" or "BLOCKED (…)") plus a nested
+        ``phase0.tally``. The old reader looked only at ``status``, got
+        "", and the roll-up then scored a genuinely BLOCKED Phase 0 as
+        PASS. We now translate the gate/tally shape.
+      • A corrupt/unreadable report was silently skipped (bare except →
+        the phase vanished from the roll-up). It is now recorded as
+        "UNREADABLE", which credibility() maps to NOT_EXERCISED, and the
+        parse error is printed.
+    """
     import os
     statuses: dict[str, str] = {}
     for ph in ("0", "1", "2", "3", "4"):
         path = os.path.join(out_dir, f"phase{ph}_report.json")
-        if os.path.isfile(path):
-            try:
-                with open(path) as f:
-                    statuses[ph] = (json.load(f).get("status") or "").upper()
-            except Exception:
-                pass
+        if not os.path.isfile(path):
+            continue    # credibility() treats the missing phase as NOT_EXERCISED
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except Exception as exc:
+            print(f"[decision_validity] cannot parse {path}: {exc}",
+                  file=sys.stderr)
+            statuses[ph] = "UNREADABLE"
+            continue
+        status = (data.get("status") or "").upper()
+        if not status:
+            # Phase 0 gate shape: gate == "OPEN" means the contract gate
+            # passed; anything else ("BLOCKED (structural)", …) is a BLOCK.
+            gate = (data.get("gate") or "").upper()
+            if gate:
+                if gate == "OPEN":
+                    tally = (data.get("phase0") or {}).get("tally") or {}
+                    status = "WARN" if tally.get("WARN", 0) > 0 else "PASS"
+                else:
+                    status = "BLOCK"
+        statuses[ph] = status or "UNRECOGNISED"
     return statuses
 
 

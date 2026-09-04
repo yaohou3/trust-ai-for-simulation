@@ -233,31 +233,59 @@ def verify_routing_rules(ctx: Phase0Context) -> list[CheckResult]:
                                   "routing_from or routing_to missing; skipped."))
             continue
 
-        # For each entity, find first service_end at src, then the very next
-        # service_start and record its process/resource.
+        # AUDIT FIX (H7): the previous implementation attributed the routing
+        # transition to the LITERALLY NEXT service_start of ANY process. In
+        # any model with interleaved concurrent processes (hourly checks,
+        # monitoring, rounding — the framework's flagship use cases), the
+        # interleaved event was captured instead of the true routing target:
+        # phantom branches entered the counts and the denominator inflated,
+        # so observed fractions bore no relation to the declared branch
+        # probabilities (systematic false FAILs — or shapeable PASSes).
+        #
+        # The search is now restricted to service_starts whose process or
+        # resource is a DECLARED routing target (∪ the optional
+        # fallback_target); terminal events still classify. Non-target
+        # service_starts are skipped (they are concurrent activity, not the
+        # routing outcome) and counted separately for visibility.
+        declared_targets = {r.get("target") for r in targets
+                            if r.get("target") is not None}
+        fallback = spec.get("fallback_target")
+        if fallback:
+            declared_targets.add(fallback)
         observed_counts: dict[str, int] = defaultdict(int)
         total = 0
+        skipped_interleaved = 0
         for _, evs in groups.items():
             evs_sorted = sorted(evs, key=lambda x: (x.get("time", 0.0), x.get("seq", 0)))
             for k, e in enumerate(evs_sorted):
                 if e.get("event") == "service_end" and (
                     e.get("process") == src or e.get("resource") == src
                 ):
-                    # Next service_start
-                    nxt = next((ev for ev in evs_sorted[k+1:]
-                                if ev.get("event") == "service_start"), None)
-                    # Or terminal
-                    if nxt is None:
-                        term = next((ev for ev in evs_sorted[k+1:]
-                                     if ev.get("event")
-                                     in ("system_departure", "loss")), None)
-                        if term is not None:
-                            observed_counts[f"__terminal__{term['event']}"] += 1
+                    routed = False
+                    for ev in evs_sorted[k+1:]:
+                        evt = ev.get("event")
+                        if evt in ("system_departure", "loss"):
+                            observed_counts[f"__terminal__{evt}"] += 1
                             total += 1
-                        continue
-                    key = nxt.get("process") or nxt.get("resource") or "_unknown_"
-                    observed_counts[key] += 1
-                    total += 1
+                            routed = True
+                            break
+                        if evt != "service_start":
+                            continue
+                        key = ev.get("process") or ev.get("resource")
+                        if key in declared_targets:
+                            observed_counts[key] += 1
+                            total += 1
+                            routed = True
+                            break
+                        # Re-entry to the source (rework loop) also counts as
+                        # a routing outcome when declared as a target above;
+                        # otherwise it and any other non-target start is
+                        # concurrent activity — skip and keep scanning.
+                        skipped_interleaved += 1
+                    if not routed:
+                        # No declared target, terminal, or further events —
+                        # entity still mid-route at horizon; not counted.
+                        pass
 
         if total == 0:
             out.append(_info_skip(f"B26_routing_rules[{i}]",
@@ -281,10 +309,14 @@ def verify_routing_rules(ctx: Phase0Context) -> list[CheckResult]:
         sev: Severity = "PASS" if not violations else "FAIL"
         out.append(CheckResult(
             sev, f"B26_routing_rules[{i}]",
-            f"from '{src}' ({total} transitions): "
+            f"from '{src}' ({total} transitions, "
+            f"{skipped_interleaved} interleaved non-target starts skipped): "
             + ("; ".join(violations) if violations else "all branches within tolerance."),
             {"observed_counts": dict(observed_counts),
-             "total_transitions": total, "violations": violations},
+             "total_transitions": total,
+             "skipped_interleaved_starts": skipped_interleaved,
+             "declared_targets": sorted(declared_targets),
+             "violations": violations},
         ))
     return out
 
@@ -1319,9 +1351,36 @@ def verify_pool_composition(ctx: Phase0Context) -> list[CheckResult]:
 
         late_grant_tol_s = 60.0  # grace for granting exactly at window_end
 
-        for w_i, window in enumerate(windows):
-            sh = float(window.get("start_hour"))
-            eh = float(window.get("end_hour"))
+        # AUDIT FIX (H6): normalize window shapes. The compliance mapper
+        # emits windows as [lo, hi] hour PAIRS (the same shape B05/B34
+        # normalize), while this check previously assumed
+        # {start_hour, end_hour} dicts — calling .get() on a list raised
+        # AttributeError → spurious BLOCK on every mapper-produced rule.
+        # Accept both shapes.
+        def _norm_b41_window(w) -> tuple[float, float] | None:
+            if isinstance(w, dict):
+                sh_, eh_ = w.get("start_hour"), w.get("end_hour")
+                if sh_ is None or eh_ is None:
+                    return None
+                return float(sh_), float(eh_)
+            if (isinstance(w, (list, tuple)) and len(w) == 2
+                    and all(isinstance(x, (int, float)) for x in w)):
+                return float(w[0]), float(w[1])
+            return None
+
+        norm_windows = []
+        for w in windows:
+            nw = _norm_b41_window(w)
+            if nw is None:
+                out.append(_info_skip(
+                    f"B41_pool_composition[{i}]",
+                    f"B41[{src}]: unrecognised window shape {w!r} "
+                    f"(expected [start_hour, end_hour] pair or "
+                    f"{{start_hour, end_hour}} dict) — window skipped."))
+            else:
+                norm_windows.append(nw)
+
+        for w_i, (sh, eh) in enumerate(norm_windows):
             onsets = _window_onsets(trace, sh, warmup=warmup)
             window_len_s = ((eh - sh) % 24) * 3600.0
 

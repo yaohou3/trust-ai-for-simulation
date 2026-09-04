@@ -343,6 +343,62 @@ def _check_routing_probabilities(
             )
 
 
+def _check_coordination_process_names(
+    compliance_spec: dict[str, list],
+    warnings: list[str],
+) -> None:
+    """Check that every coordination_patterns entry's `process` field
+    matches a declared service_rates entry.
+
+    Phase 0's B07 (`verify_coordination_patterns`) matches soft-pool
+    participants by looking for `service_start` events whose `process`
+    field equals the coordination element's own `process` name. If the
+    two elements describe the same real-world activity but were
+    declared under different descriptive names at Stage A, B07 silently
+    reports 0 participants — a common outcome for DSL authors who
+    (reasonably) gave the coordination pool and the service_process
+    different names. This early-stage warning surfaces the coupling
+    before Phase 0 runs, so the DSL can be corrected up front rather
+    than debugged via a B07 FAIL later."""
+    coord = compliance_spec.get("coordination_patterns") or []
+    services = compliance_spec.get("service_rates") or []
+    service_names = set()
+    service_resources = set()
+    for s in services:
+        if not isinstance(s, dict):
+            continue
+        for key in ("name", "process", "resource"):
+            v = s.get(key)
+            if v:
+                service_names.add(v)
+        for r in (s.get("resources") or []):
+            if r:
+                service_resources.add(r)
+    all_service_labels = service_names | service_resources
+    for i, c in enumerate(coord):
+        if not isinstance(c, dict):
+            continue
+        proc = c.get("process") or c.get("name")
+        if not proc:
+            continue
+        if all_service_labels and proc not in all_service_labels:
+            source = ((c.get("source_ids") or ["?"])[0]
+                      if isinstance(c.get("source_ids"), list)
+                      else "?")
+            warnings.append(
+                f"  coordination_patterns[{i}] ({source}) declares "
+                f"process={proc!r}, which does not match any declared "
+                f"service_rates.name / .process / .resource. Phase 0's "
+                f"B07 will report 0 participants for this coordination "
+                f"element unless the two names are aligned. Either "
+                f"rename the coordination element to match the "
+                f"corresponding service_process, or rename the "
+                f"service_process to match. Declared service labels: "
+                f"{sorted(all_service_labels)[:8]}"
+                + ("..." if len(all_service_labels) > 8 else "")
+            )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Public API
 # ─────────────────────────────────────────────────────────────────────────────
@@ -386,6 +442,7 @@ def validate(
     _check_schema(compliance_spec, errors, warnings)
     _check_vague_clauses(elements, warnings)
     _check_routing_probabilities(compliance_spec, warnings, errors)
+    _check_coordination_process_names(compliance_spec, warnings)
 
     # Combine grounding errors into main errors list for verdict
     all_errors = errors + grounding_errors

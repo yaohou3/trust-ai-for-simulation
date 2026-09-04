@@ -673,6 +673,43 @@ PIPELINE_ARTIFACT_SCHEMA: dict = {
         "model_assumptions": {
             "type": "array", "items": {"type": "string"},
         },
+        # Simulation regime (v5.4): classical Sargent distinction between
+        # terminating and non-terminating (steady-state) simulations.
+        # Downstream checks that assume steady state (Little's Law utilization
+        # identity §1.3, extreme-capacity divergence §2.3.1, warm-up detection
+        # §3.1.3, arrival-rate window B01) read this field to select the
+        # appropriate measurement basis or skip themselves when not applicable.
+        #
+        #   steady_state: default. Non-terminating queueing system with a
+        #     stationary arrival process; steady-state metrics apply.
+        #
+        #   terminating:  finite population, defined end time, no meaningful
+        #     steady state (e.g. single-shift analysis, one-off event).
+        #     Little's Law utilization identity, MSER-5 warm-up, and
+        #     M/M/c limiting-regime checks are not appropriate and are
+        #     skipped with INFO. Terminating-aware variants apply where
+        #     available.
+        #
+        #   burst:        subclass of terminating with a declared arrival
+        #     window followed by a drain phase. Requires
+        #     `arrival_window_seconds`. Rate-based checks measure over the
+        #     window rather than the full run_length.
+        "simulation_regime": {
+            "type": ["object", "null"],
+            "properties": {
+                "type": {"type": "string",
+                         "enum": ["steady_state", "terminating", "burst"]},
+                "arrival_window_seconds": {"type": ["number", "null"]},
+                "total_entities": {"type": ["integer", "null"]},
+                "rationale": {"type": ["string", "null"]},
+            },
+            "description":
+                "Classical Sargent terminating vs non-terminating regime. "
+                "Steady-state checks (Little's Law utilization identity, "
+                "MSER-5 warm-up, M/M/c limiting regimes, arrival-rate "
+                "windowing) consult this field. Defaults to steady_state "
+                "when absent.",
+        },
         "dsl_elements": {
             "type": "array",
             "items": DSL_ELEMENT_SCHEMA,
